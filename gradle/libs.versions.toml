@@ -1,0 +1,15 @@
+[versions]
+kotlin = "2.2.0"
+lattuce = "7.6.0.RELEASE"
+kotlinx = "1.11.0"
+cron = "9.2.1"
+coroutines = "1.11.0"
+
+[libraries]
+kotlinx-serialization = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx" }
+lattuce-core = { module = "io.lettuce:lettuce-core", version.ref = "lattuce" }
+cron-utils = { module = "com.cronutils:cron-utils", version.ref = "cron"  }
+kotlinx-coroutines = {module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines"}
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
