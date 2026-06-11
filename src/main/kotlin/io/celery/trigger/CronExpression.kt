@@ -1,4 +1,4 @@
-package io.celery.core
+package io.celery.trigger
 
 import kotlinx.serialization.Serializable
 import java.time.DayOfWeek

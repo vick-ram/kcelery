@@ -1,5 +1,7 @@
-package io.celery
+package io.celery.redis
 
+import io.celery.model.BrokerRecord
+import io.celery.model.TaskMessage
 import io.lettuce.core.Consumer
 import io.lettuce.core.ExperimentalLettuceCoroutinesApi
 import io.lettuce.core.Limit
@@ -18,6 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.time.Duration
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalLettuceCoroutinesApi::class)
@@ -109,19 +112,12 @@ class RedisBroker(
         launch {
             while (isActive) {
                 try {
-                    recoverPending(
-                        queue,
-                        consumerGroup,
-                        consumerName,
-                        ::send
-                    )
+                    recoverPending(queue, consumerGroup, consumerName, ::send)
+                } catch (e: CancellationException) {
+                    throw e // Allow the coroutine to shut down gracefully
                 } catch (e: Exception) {
-                    logger.error(
-                        "Failed pending recovery for queue=$queue",
-                        e
-                    )
+                    logger.error("Failed pending recovery for queue=$queue", e)
                 }
-
                 delay(10.seconds)
             }
         }
@@ -205,20 +201,21 @@ class RedisBroker(
         while (currentCoroutineContext().isActive) {
             val now = System.currentTimeMillis()
             // Get tasks whose ETA has passed
-            val due = redis.zrangebyscore(scheduledKey(), Range.create(0.0, now.toDouble()), Limit.from( 10))
+            val due = redis.zrangebyscore(scheduledKey(), Range.create(0.0, now.toDouble()), Limit.from(10))
 
 
             due
                 .collect { taskId ->
-                val taskJson = redis.get(taskKey(taskId)) ?: return@collect
-                val task = json.decodeFromString<TaskMessage>(taskJson)
-                val streamKey = streamKey(task.queue)
+                    val taskJson = redis.get(taskKey(taskId)) ?: return@collect
+                    val task = json.decodeFromString<TaskMessage>(taskJson)
+                    val streamKey = streamKey(queue)
 
                     // Move to ready queue
                     redis.xadd(streamKey, mapOf("task" to taskJson))
                     redis.zrem(scheduledKey(), taskId)
                     redis.del(taskKey(taskId))
                 }
+            delay(1.seconds)
         }
     }
 

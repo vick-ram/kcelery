@@ -1,6 +1,7 @@
-package io.celery.core
+package io.celery.metrics
 
 import io.micrometer.core.instrument.MeterRegistry
+import java.time.Duration
 import java.util.concurrent.atomic.AtomicLong
 
 class SchedulerMetrics(
@@ -21,7 +22,7 @@ class SchedulerMetrics(
         registry.gauge("celery.scheduler.retries.total", taskRetries)
     }
 
-    fun recordExecution(taskName: String, duration: java.time.Duration) {
+    fun recordExecution(taskName: String, duration: Duration) {
         taskExecutions.incrementAndGet()
         registry.timer("celery.task.execution",
             "scheduler", schedulerName,

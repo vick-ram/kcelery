@@ -1,7 +1,8 @@
 package io.celery.core
 
-import io.celery.TaskState
+import io.celery.model.TaskState
 import io.celery.config.InstantSerializer
+import io.celery.trigger.Trigger
 import kotlinx.serialization.Serializable
 import java.time.Instant
 import java.util.concurrent.Delayed

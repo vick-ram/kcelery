@@ -1,4 +1,4 @@
-package io.celery
+package io.celery.model
 
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.JsonElement

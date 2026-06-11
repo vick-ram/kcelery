@@ -1,4 +1,4 @@
-package io.celery
+package io.celery.model
 
 data class BrokerRecord(
     val messageId: String,

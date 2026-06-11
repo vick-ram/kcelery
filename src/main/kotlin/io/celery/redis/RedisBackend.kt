@@ -1,5 +1,6 @@
-package io.celery
+package io.celery.redis
 
+import io.celery.model.TaskResult
 import io.lettuce.core.ExperimentalLettuceCoroutinesApi
 import io.lettuce.core.api.coroutines.RedisCoroutinesCommands
 import kotlinx.serialization.json.Json

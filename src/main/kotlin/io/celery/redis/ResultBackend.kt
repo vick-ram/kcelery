@@ -1,4 +1,6 @@
-package io.celery
+package io.celery.redis
+
+import io.celery.model.TaskResult
 
 interface ResultBackend {
     suspend fun storeResult(taskId: String, result: TaskResult, expirySeconds: Long = 3600)

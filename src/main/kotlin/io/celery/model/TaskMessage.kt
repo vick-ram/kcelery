@@ -1,4 +1,4 @@
-package io.celery
+package io.celery.model
 
 import io.celery.config.InstantSerializer
 import kotlinx.serialization.Serializable

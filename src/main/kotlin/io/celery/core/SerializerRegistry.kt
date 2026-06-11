@@ -1,4 +1,4 @@
-package io.celery
+package io.celery.core
 
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
@@ -6,6 +6,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.collections.get
 import kotlin.reflect.KClass
 
 class SerializerRegistry {

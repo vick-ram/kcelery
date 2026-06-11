@@ -1,7 +1,8 @@
-package io.celery.core
+package io.celery.redis
 
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.*
+import kotlinx.coroutines.future.await
 import org.redisson.api.RedissonClient
 import org.slf4j.LoggerFactory
 import java.util.concurrent.TimeUnit
@@ -18,6 +19,10 @@ class RedisDistributedLockManager(private val redissonClient: RedissonClient) : 
 
     private val logger = LoggerFactory.getLogger(javaClass)
     private val leaderHolders = ConcurrentHashMap.newKeySet<String>()
+    private val renewalJobs = ConcurrentHashMap<String, Job>()
+
+    // Dedicated dispatcher for blocking Redis operations
+    private val redisDispatcher = Dispatchers.IO.limitedParallelism(10)
 
     override suspend fun <T> withLock(
         lockName: String,
@@ -28,14 +33,24 @@ class RedisDistributedLockManager(private val redissonClient: RedissonClient) : 
 
         return try {
             val acquired = withTimeout(timeout) {
-                lock.tryLock(0, timeout.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+                withContext(redisDispatcher) {
+                    lock.tryLock(timeout.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+                }
             }
 
             if (acquired) {
                 try {
                     block()
                 } finally {
-                    lock.unlock()
+                    withContext(redisDispatcher) {
+                        try {
+                            if (lock.isHeldByCurrentThread) {
+                                lock.unlock()
+                            }
+                        } catch (e: Exception) {
+                            logger.error("Failed to unlock: $lockName", e)
+                        }
+                    }
                 }
             } else {
                 logger.warn("Failed to acquire lock: $lockName within timeout")
@@ -53,20 +68,32 @@ class RedisDistributedLockManager(private val redissonClient: RedissonClient) : 
     override suspend fun tryAcquireLeadership(leaderKey: String, ttl: Duration): Boolean {
         val lock = redissonClient.getLock("celery:leader:$leaderKey")
         return try {
-            val acquired = lock.tryLock(0, ttl.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+            val acquired = withContext(redisDispatcher) {
+                lock.tryLock(ttl.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+            }
+
             if (acquired) {
                 leaderHolders.add(leaderKey)
-                // Start renewal coroutine
-                CoroutineScope(Dispatchers.Default).launch {
+                renewalJobs[leaderKey]?.cancel()
+
+                val job = CoroutineScope(redisDispatcher + SupervisorJob()).launch {
                     try {
                         while (isActive && leaderHolders.contains(leaderKey)) {
-                            delay((ttl / 2).inWholeMilliseconds.milliseconds)
-                            lock.tryLock(0, ttl.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+                            delay((ttl / 2).inWholeMilliseconds)
+                            lock.tryLock(ttl.inWholeMilliseconds, TimeUnit.MILLISECONDS)
                         }
+                    } catch (e: Exception) {
+                        logger.error("Failed to renew leadership: $leaderKey", e)
                     } finally {
                         leaderHolders.remove(leaderKey)
+                        renewalJobs.remove(leaderKey)
+                        if (lock.isHeldByCurrentThread) {
+                            lock.unlock()
+                        }
                     }
                 }
+
+                renewalJobs[leaderKey] = job
             }
             acquired
         } catch (e: Exception) {

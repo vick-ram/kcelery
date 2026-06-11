@@ -2,10 +2,10 @@ package io.celery.config
 
 import io.lettuce.core.ExperimentalLettuceCoroutinesApi
 
-import io.celery.core.CronScheduler
+import io.celery.scheduler.CronScheduler
 import io.celery.core.Clock
-import io.celery.core.RedisDistributedLockManager
-import io.celery.core.SchedulerMetrics
+import io.celery.redis.RedisDistributedLockManager
+import io.celery.metrics.SchedulerMetrics
 import io.lettuce.core.RedisClient
 import io.lettuce.core.api.coroutines
 import io.lettuce.core.api.coroutines.RedisCoroutinesCommands
@@ -31,6 +31,7 @@ data class SchedulerConfig(
 
 class SchedulerFactory {
 
+    @OptIn(ExperimentalLettuceCoroutinesApi::class)
     fun create(config: SchedulerConfig, meterRegistry: MeterRegistry? = null): CronScheduler {
 
         // Redis connection

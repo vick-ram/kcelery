@@ -1,28 +1,43 @@
-package io.celery
+package io.celery.scheduler
 
-import io.celery.core.Trigger
-import kotlinx.serialization.Serializable
+import io.celery.model.CeleryTask
+import io.celery.redis.MessageBroker
+import io.celery.redis.ResultBackend
+import io.celery.model.ScheduleInfo
+import io.celery.model.TaskContext
+import io.celery.model.TaskMessage
+import io.celery.model.TaskRegistry
+import io.celery.model.TaskResult
+import io.celery.model.TaskState
 import io.celery.core.Clock
-import io.celery.core.CronExpression
-import io.celery.core.CronScheduler
-import io.celery.core.DistributedLockManager
 import io.celery.core.ScheduledTask
-import io.celery.core.SchedulerMetrics
 import io.celery.core.TaskConfig
+import io.celery.metrics.SchedulerMetrics
+import io.celery.redis.DistributedLockManager
+import io.celery.trigger.CronExpression
+import io.celery.trigger.Trigger
 import io.lettuce.core.ExperimentalLettuceCoroutinesApi
 import io.lettuce.core.api.coroutines.RedisCoroutinesCommands
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.time.withTimeout
 import kotlinx.serialization.KSerializer
-import kotlinx.serialization.json.*
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.DelayQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
@@ -426,7 +441,7 @@ class CelerySchedulerBridge(
             updateTaskState(context.taskId, TaskState.RUNNING)
 
             // Execute with timeout
-            val result = withTimeout(5.minutes) {
+            val result = kotlinx.coroutines.withTimeout(5.minutes) {
                 // Cast `task` to `CeleryTask<Any?>` to call its `run` method, which returns `Any?`.
                 task.run(context)
             }
@@ -510,7 +525,7 @@ class CelerySchedulerBridge(
                 context.taskId,
                 TaskResult(
                     taskId = context.taskId,
-                    state = io.celery.TaskState.FAILURE,
+                    state = TaskState.FAILURE,
                     traceback = error.stackTraceToString(),
                     completedAt = clock.instant()
                 )
@@ -539,8 +554,8 @@ class CelerySchedulerBridge(
         scope.launch {
             while (running.get()) {
                 try {
-                    val task = withTimeout(1.seconds) {
-                        taskQueue.poll(1, java.util.concurrent.TimeUnit.SECONDS)
+                    val task = kotlinx.coroutines.withTimeout(1.seconds) {
+                        taskQueue.poll(1, TimeUnit.SECONDS)
                     }
 
                     if (task != null && task.state == TaskState.SCHEDULED) {

@@ -2,14 +2,24 @@
 kotlin = "2.2.0"
 lattuce = "7.6.0.RELEASE"
 kotlinx = "1.11.0"
-cron = "9.2.1"
 coroutines = "1.11.0"
+coroutines-reactive = "1.11.0"
+logging = "2.0.9"
+logback = "1.5.34"
+micrometer = "1.11.5"
+redisson = "4.5.0"
 
 [libraries]
 kotlinx-serialization = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx" }
 lattuce-core = { module = "io.lettuce:lettuce-core", version.ref = "lattuce" }
-cron-utils = { module = "com.cronutils:cron-utils", version.ref = "cron"  }
-kotlinx-coroutines = {module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines"}
+kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-reactive = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-reactive", version.ref = "coroutines-reactive" }
+slf4j-logging = { module = "org.slf4j:slf4j-api", version.ref = "logging" }
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+micrometer-core = { module = "io.micrometer:micrometer-core", version.ref = "micrometer" }
+micrometer-registry-prometheus = { module = "io.micrometer:micrometer-registry-prometheus", version.ref = "micrometer" }
+redisson = { module = "org.redisson:redisson", version.ref = "redisson" }
+
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

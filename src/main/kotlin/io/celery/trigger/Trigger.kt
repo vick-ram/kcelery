@@ -1,8 +1,10 @@
-package io.celery.core
+package io.celery.trigger
 
 import io.celery.config.InstantSerializer
+import io.celery.core.Clock
 import kotlinx.serialization.Serializable
 import java.time.Instant
+import java.time.ZonedDateTime
 
 @Serializable
 sealed interface Trigger {
@@ -16,7 +18,7 @@ sealed interface Trigger {
                 if (it.isAfter(now)) now else it
             } ?: now
 
-            val zonedNow = java.time.ZonedDateTime.ofInstant(baseTime, clock.zone())
+            val zonedNow = ZonedDateTime.ofInstant(baseTime, clock.zone())
             return expression.nextMatchAfter(zonedNow).toInstant()
         }
     }

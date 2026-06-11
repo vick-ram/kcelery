@@ -1,4 +1,4 @@
-package io.celery
+package io.celery.model
 
 import java.util.concurrent.ConcurrentHashMap
 
