@@ -52,7 +52,7 @@ abstract class RedisTestBase : TestBase() {
         }
         redissonClient = Redisson.create(redissonConfig)
 
-        lockManager = RedisDistributedLockManager(redissonClient)
+        lockManager = RedisDistributedLockManager(redisClient)
     }
 
     @OptIn(ExperimentalLettuceCoroutinesApi::class)

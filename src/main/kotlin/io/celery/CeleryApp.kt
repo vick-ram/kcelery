@@ -84,7 +84,7 @@ class CeleryApp(
         // Initialize components
         broker = RedisBroker(redisCommands, json, name)
         backend = RedisBackend(redisCommands, json, name)
-        lockManager = RedisDistributedLockManager(redissonClient)
+        lockManager = RedisDistributedLockManager(redisClient)
 
         val meterRegistry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
         metrics = SchedulerMetrics(meterRegistry, name)

@@ -46,7 +46,7 @@ class SchedulerFactory {
         val redissonClient: RedissonClient = Redisson.create(redissonConfig)
 
         // Distributed lock manager
-        val lockManager = RedisDistributedLockManager(redissonClient)
+        val lockManager = RedisDistributedLockManager(redisClient)
 
         // Metrics
         val metrics = SchedulerMetrics(

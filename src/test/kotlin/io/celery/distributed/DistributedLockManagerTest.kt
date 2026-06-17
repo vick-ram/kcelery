@@ -90,7 +90,7 @@ class DistributedLockManagerTest : RedisTestBase() {
 
         // Create second lock manager
         val secondLockManager =
-            RedisDistributedLockManager(redissonClient)
+            RedisDistributedLockManager(redisClient)
 
         // Second instance should not become leader
         val isLeader2 = secondLockManager.tryAcquireLeadership("test-leader-2", 30.seconds)
