@@ -1,7 +1,7 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
     kotlin("plugin.serialization") version "2.4.0"
-    id("maven-publish") // Add the maven-publish plugin
+    id("maven-publish")
 }
 
 group = "io.kcelery"
@@ -40,20 +40,14 @@ dependencies {
 }
 
 kotlin {
-    jvmToolchain(21)
-//    compilerOptions {
-//        freeCompilerArgs.addAll(
-//            "-Xjsr305=strict",
-//            "-Xcontext-receivers"
-//        )
-//    }
+    jvmToolchain(17)
 }
 
 java {
     withSourcesJar()
     withJavadocJar()
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
 }
 
 tasks.test {
