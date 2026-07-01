@@ -26,9 +26,6 @@ dependencies {
     implementation(libs.micrometer.core)
     implementation(libs.micrometer.registry.prometheus)
 
-    // Distributed locking
-    implementation(libs.redisson) { exclude(group = "io.netty") }
-
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
     testImplementation("io.mockk:mockk:1.13.12")

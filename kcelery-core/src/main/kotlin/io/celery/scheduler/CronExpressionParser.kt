@@ -1,11 +1,7 @@
-package io.celery.trigger
-
-import kotlinx.serialization.Serializable
-import java.time.DayOfWeek
-import java.time.ZonedDateTime
+package io.celery.scheduler
 
 @Serializable
-data class CronExpression(
+data class CronExpressionParser(
     val seconds: Set<Int> = setOf(0),
     val minutes: Set<Int> = setOf(0),
     val hours: Set<Int> = setOf(0),
@@ -119,7 +115,7 @@ data class CronExpression(
     }
 
     companion object {
-        fun parse(expression: String): CronExpression {
+        fun parse(expression: String): CronExpressionParser {
             val parts = expression.trim().split("\\s+".toRegex())
 
             require(parts.size in 5..6) {
@@ -128,7 +124,7 @@ data class CronExpression(
 
             val offset = if (parts.size == 6) 0 else -1
 
-            return CronExpression(
+            return CronExpressionParser(
                 seconds = if (offset == 0) parseField(parts[0], 0..59, "seconds") else setOf(0),
                 minutes = parseField(parts[1 + offset], 0..59, "minutes"),
                 hours = parseField(parts[2 + offset], 0..23, "hours"),
