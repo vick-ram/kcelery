@@ -538,8 +538,6 @@ class CeleryApp private constructor(
         )
     }
 
-    // ==================== Private Helpers ====================
-
     /**
      * Execute a task (called by schedulers and workers).
      */

@@ -1,14 +1,16 @@
-// kcelery-redis/src/main/kotlin/io/celery/redis/RedisDeadLetterQueue.kt
 package io.celery.redis
 
-import io.celery.deadletter.*
+import io.celery.deadletter.DeadLetterQueue
+import io.celery.deadletter.DeadLetterRecord
+import io.celery.deadletter.DeadLetterStats
 import io.celery.task.TaskMessage
 import io.lettuce.core.ExperimentalLettuceCoroutinesApi
+import io.lettuce.core.Range
 import kotlinx.coroutines.*
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.isActive
-import kotlinx.serialization.encodeToString
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.toList
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.time.Instant
@@ -156,10 +158,10 @@ class RedisDeadLetterQueue(
             if (ids.isEmpty()) return emptyList()
 
             val keys = ids.map { recordKey(it) }
-            val records = commands.mget(*keys.toTypedArray())
+            val records = commands.mget(*keys.toTypedArray()).toList()
 
-            ids.zip(records.mapNotNull { recordJson ->
-                recordJson?.let {
+            ids.zip(records.mapNotNull { kv ->
+                kv.value?.let {
                     try {
                         json.decodeFromString<DeadLetterRecord>(it)
                     } catch (e: Exception) {
@@ -190,10 +192,10 @@ class RedisDeadLetterQueue(
             if (ids.isEmpty()) break
 
             val keys = ids.map { recordKey(it) }
-            val records = commands.mget(*keys.toTypedArray())
+            val records = commands.mget(*keys.toTypedArray()).toList()
 
-            ids.zip(records).forEach { (_, recordJson) ->
-                recordJson?.let {
+            ids.zip(records).forEach { (_, kv) ->
+                kv.value?.let {
                     try {
                         val record = json.decodeFromString<DeadLetterRecord>(it)
                         if (taskName == null || record.task.taskName == taskName) {
@@ -246,12 +248,14 @@ class RedisDeadLetterQueue(
             // Get old records
             val oldIds = commands.zrangebyscore(
                 indexKey(),
-                "0",
-                cutoff.toEpochMilli().toString()
-            ) ?: emptyList()
+                Range.create(
+                    0.0,
+                    cutoff.toEpochMilli().toDouble()
+                )
+            )
 
             // Delete them
-            oldIds.forEach { id ->
+            oldIds.collect { id ->
                 commands.del(recordKey(id))
                 commands.zrem(indexKey(), id)
                 purged++
