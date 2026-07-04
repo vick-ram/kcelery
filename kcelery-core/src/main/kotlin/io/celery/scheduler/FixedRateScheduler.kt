@@ -3,63 +3,41 @@ package io.celery.scheduler
 import io.celery.task.TaskConfig
 import io.celery.task.TaskContext
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.PriorityBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * Fixed rate scheduler.
- * Executes tasks at a fixed rate, regardless of execution time.
- * If execution takes longer than the period, the next execution starts immediately.
- */
 class FixedRateScheduler(
     private val taskExecutor: suspend (String, TaskContext) -> Unit,
-    private val clock: () -> Instant = { Instant.now() },
-    private val threadPoolSize: Int = Runtime.getRuntime().availableProcessors()
+    private val clock: () -> Instant = { Instant.now() }
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     private val schedules = ConcurrentHashMap<String, FixedRateSchedule>()
     private val running = ConcurrentHashMap.newKeySet<String>()
+    private val executionJobs = ConcurrentHashMap<String, Job>()
 
-    private val queue = PriorityBlockingQueue<RateExecution>(
-        11,
-        compareBy { it.nextExecutionTime }
-    )
-
+    private val wakeUpSignal = Channel<Unit>(Channel.CONFLATED)
     private var schedulerJob: Job? = null
     private val isRunning = AtomicBoolean(false)
 
     data class FixedRateSchedule(
+        val taskId: String,
         val taskName: String,
         val period: Duration,
         val config: TaskConfig,
         val startTime: Instant,
-        val executionCount: Long = 0
+        val executionCount: Long,
+        val nextExecutionTime: Instant
     )
 
-    data class RateExecution(
-        val taskName: String,
-        val nextExecutionTime: Instant,
-        val config: TaskConfig,
-        val executionNumber: Long
-    ) : Comparable<RateExecution> {
-        override fun compareTo(other: RateExecution): Int {
-            return nextExecutionTime.compareTo(other.nextExecutionTime)
-        }
-    }
-
-    /**
-     * Schedule a task at a fixed rate.
-     * The rate is measured from the START of each execution.
-     */
     fun schedule(
         taskName: String,
         period: Duration,
@@ -69,56 +47,60 @@ class FixedRateScheduler(
         require(period.isPositive()) { "Period must be positive, got: $period" }
 
         val start = startTime ?: clock()
-        val schedule = FixedRateSchedule(taskName, period, config, start)
+        val now = clock()
         val taskId = "$taskName-fixed-rate-${Instant.now().toEpochMilli()}"
 
-        schedules[taskId] = schedule
-
-        // Calculate first execution
-        val now = clock()
+        // Calculate first alignment execution target cleanly
         val firstExecution = if (now.isBefore(start)) {
             start
         } else {
-            // Calculate next execution based on start time
             val elapsed = now.toEpochMilli() - start.toEpochMilli()
-            val periods = max(0, elapsed / period.inWholeMilliseconds) + 1
+            val periods = (elapsed / period.inWholeMilliseconds) + 1
             start.plusMillis(periods * period.inWholeMilliseconds)
         }
 
-        val executionNumber = max(0,
-            (firstExecution.toEpochMilli() - start.toEpochMilli()) / period.inWholeMilliseconds()
+        val initialExecutionNumber = max(0L, (firstExecution.toEpochMilli() - start.toEpochMilli()) / period.inWholeMilliseconds)
+
+        schedules[taskId] = FixedRateSchedule(
+            taskId = taskId,
+            taskName = taskName,
+            period = period,
+            config = config,
+            startTime = start,
+            executionCount = initialExecutionNumber,
+            nextExecutionTime = firstExecution
         )
 
-        queue.offer(RateExecution(taskName, firstExecution, config, executionNumber))
-
-        logger.info("Scheduled fixed-rate task: $taskName with period: $period")
+        logger.info("Scheduled fixed-rate task '$taskName' (id=$taskId) period=$period first=$firstExecution")
+        wakeUpSignal.trySend(Unit)
         return taskId
     }
 
-    /**
-     * Update the period for an existing schedule.
-     */
     fun updatePeriod(taskId: String, newPeriod: Duration) {
         require(newPeriod.isPositive()) { "Period must be positive, got: $newPeriod" }
 
-        schedules.computeIfPresent(taskId) { _, schedule ->
-            schedule.copy(period = newPeriod)
-        }
+        schedules.computeIfPresent(taskId) { _, old ->
+            val now = clock()
+            // Reset base timeline coordinates cleanly to match new calculations seamlessly
+            val elapsed = now.toEpochMilli() - old.startTime.toEpochMilli()
+            val periods = (elapsed / newPeriod.inWholeMilliseconds) + 1
+            val nextTime = old.startTime.plusMillis(periods * newPeriod.inWholeMilliseconds)
 
-        logger.info("Updated period for $taskId to $newPeriod")
+            old.copy(
+                period = newPeriod,
+                nextExecutionTime = nextTime
+            )
+        }
+        logger.info("Updated period for task '$taskId' to $newPeriod")
+        wakeUpSignal.trySend(Unit)
     }
 
-    /**
-     * Unschedule a task.
-     */
     fun unschedule(taskId: String) {
         schedules.remove(taskId)
-        logger.info("Unscheduled task: $taskId")
+        logger.info("Unscheduled task '$taskId'")
+        wakeUpSignal.trySend(Unit)
     }
 
-    /**
-     * Start the scheduler.
-     */
     fun start() {
         if (!isRunning.compareAndSet(false, true)) {
             logger.warn("FixedRateScheduler already running")
@@ -128,26 +110,47 @@ class FixedRateScheduler(
         schedulerJob = scope.launch {
             while (isActive && isRunning.get()) {
                 try {
-                    val execution = withTimeoutOrNull(1.seconds) {
-                        queue.take()
+                    val now = clock()
+                    val tasksToLaunch = mutableListOf<Pair<FixedRateSchedule, Instant>>()
+
+                    val dueEntries = schedules.entries
+                        .filter { (_, s) -> !s.nextExecutionTime.isAfter(now) }
+
+                    for (entry in dueEntries) {
+                        val taskId = entry.key
+                        val scheduledFireTime = entry.value.nextExecutionTime
+
+                        schedules.computeIfPresent(taskId) { _, current ->
+                            tasksToLaunch.add(current to scheduledFireTime)
+
+                            // Advance the execution tracking schedule atomically inside loop thread
+                            val nextCount = current.executionCount + 1
+                            val nextTime = current.startTime.plusMillis(nextCount * current.period.inWholeMilliseconds)
+                            current.copy(executionCount = nextCount, nextExecutionTime = nextTime)
+                        }
                     }
 
-                    if (execution != null) {
-                        val now = clock()
+                    // Fire off all validated jobs asynchronously
+                    for ((schedule, scheduledTime) in tasksToLaunch) {
+                        val execKey = "${schedule.taskId}-${now.toEpochMilli()}"
+                        val job = launch { executeTask(schedule, scheduledTime) }
 
-                        // Wait until execution time
-                        val delayMs = execution.nextExecutionTime.toEpochMilli() - now.toEpochMilli()
-                        if (delayMs > 0) {
-                            delay(delayMs.milliseconds)
-                        }
-
-                        launch {
-                            executeTask(execution)
-                        }
-
-                        // Schedule next execution immediately (fixed rate)
-                        scheduleNext(execution)
+                        executionJobs[execKey] = job
+                        job.invokeOnCompletion { executionJobs.remove(execKey) }
                     }
+
+                    // Dynamic sleep block
+                    val nextWakeMs = schedules.values.minOfOrNull { it.nextExecutionTime.toEpochMilli() }
+                    val sleepMs = if (nextWakeMs != null) {
+                        (nextWakeMs - clock().toEpochMilli()).coerceIn(10L, 60_000L)
+                    } else {
+                        60_000L
+                    }
+
+                    withTimeoutOrNull(sleepMs.milliseconds) {
+                        wakeUpSignal.receive()
+                    }
+
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -156,116 +159,79 @@ class FixedRateScheduler(
                 }
             }
         }
-
         logger.info("FixedRateScheduler started")
     }
 
-    /**
-     * Stop the scheduler.
-     */
     suspend fun stop() {
         isRunning.set(false)
         schedulerJob?.cancelAndJoin()
+        // Wait for all in-flight asynchronous executions gracefully before scope teardown
+        executionJobs.values.joinAll()
+        executionJobs.clear()
         scope.cancel()
         logger.info("FixedRateScheduler stopped")
     }
 
-    private suspend fun executeTask(execution: RateExecution) {
-        val taskId = execution.taskName
-        val schedule = schedules.values.find { it.taskName == taskId }
-            ?: return
+    private suspend fun executeTask(schedule: FixedRateSchedule, scheduledFireTime: Instant) {
+        val taskId = schedule.taskId
+        if (!schedules.containsKey(taskId)) return
 
-        // Handle misfire
         val now = clock()
-        val isMisfire = execution.nextExecutionTime.isBefore(now.minusSeconds(1))
+        val isMisfire = scheduledFireTime.isBefore(now.minusSeconds(1))
 
         if (isMisfire) {
-            when (execution.config.misfirePolicy) {
+            when (schedule.config.misfirePolicy) {
                 MisfirePolicy.IGNORE -> {
-                    logger.debug("Ignoring misfire for task: $taskId")
+                    logger.debug("Ignoring misfire for fixed-rate task '$taskId'")
                     return
                 }
                 MisfirePolicy.FIRE_ONCE -> {
-                    logger.info("Firing once for misfired task: $taskId")
+                    logger.info("Firing once for misfired fixed-rate task '$taskId'")
+                    fireTask(schedule, now, isMisfire = true)
+                    return
                 }
                 MisfirePolicy.FIRE_ALL -> {
-                    logger.info("Firing all missed for task: $taskId")
-                    // Fire all missed executions
-                    var missedTime = execution.nextExecutionTime
-                    val period = schedule.period
+                    logger.info("Firing all missed iterations sequentially for task '$taskId'")
+                    var missedTime = scheduledFireTime
                     while (missedTime.isBefore(now)) {
-                        fireTask(taskId, missedTime, execution.config, true, execution.executionNumber)
-                        missedTime = missedTime.plusMillis(period.inWholeMilliseconds)
+                        fireTask(schedule, missedTime, isMisfire = true)
+                        missedTime = missedTime.plusMillis(schedule.period.inWholeMilliseconds)
                     }
                     return
                 }
             }
         }
 
-        fireTask(taskId, execution.nextExecutionTime, execution.config, isMisfire, execution.executionNumber)
+        fireTask(schedule, scheduledFireTime, isMisfire = false)
     }
 
-    private suspend fun fireTask(
-        taskId: String,
-        executionTime: Instant,
-        config: TaskConfig,
-        isMisfire: Boolean,
-        executionNumber: Long
-    ) {
-        // Check concurrent execution
-        if (!config.allowConcurrentExecution && running.contains(taskId)) {
-            logger.debug("Skipping concurrent execution of: $taskId")
+    private suspend fun fireTask(schedule: FixedRateSchedule, executionTime: Instant, isMisfire: Boolean) {
+        val taskId = schedule.taskId
+        if (!schedule.config.allowConcurrentExecution && running.contains(taskId)) {
+            logger.debug("Skipping concurrent execution of fixed-rate task '$taskId'")
             return
         }
 
+        running.add(taskId)
         try {
-            running.add(taskId)
-
-            val context = TaskContext(
-                taskId = "$taskId-${executionTime.toEpochMilli()}",
-                taskName = taskId,
-                executionTime = executionTime,
-                isMisfire = isMisfire,
-                isScheduled = true
+            taskExecutor(
+                schedule.taskName,
+                TaskContext(
+                    taskId = "$taskId-${executionTime.toEpochMilli()}",
+                    taskName = schedule.taskName,
+                    executionTime = executionTime,
+                    isMisfire = isMisfire,
+                    isScheduled = true
+                )
             )
-
-            taskExecutor(taskId, context)
-
-            // Update execution count
-            schedules.computeIfPresent(taskId) { _, schedule ->
-                schedule.copy(executionCount = executionNumber + 1)
-            }
-
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            logger.error("Failed to execute fixed-rate task: $taskId", e)
+            logger.error("Failed to execute fixed-rate task '$taskId'", e)
         } finally {
             running.remove(taskId)
         }
     }
 
-    private fun scheduleNext(execution: RateExecution) {
-        val schedule = schedules.values.find { it.taskName == execution.taskName } ?: return
-
-        val nextExecutionNumber = execution.executionNumber + 1
-        val nextExecutionTime = schedule.startTime.plusMillis(
-            nextExecutionNumber * schedule.period.inWholeMilliseconds
-        )
-
-        queue.offer(RateExecution(
-            execution.taskName,
-            nextExecutionTime,
-            execution.config,
-            nextExecutionNumber
-        ))
-    }
-
-    /**
-     * Get all scheduled tasks.
-     */
     fun getScheduledTasks(): List<FixedRateSchedule> = schedules.values.toList()
-
-    /**
-     * Get pending executions.
-     */
-    fun getPendingExecutions(): List<RateExecution> = queue.toList()
 }

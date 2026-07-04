@@ -3,82 +3,92 @@ package io.celery.redis
 import io.lettuce.core.ClientOptions
 import io.lettuce.core.ReadFrom
 import io.lettuce.core.SocketOptions
+import io.lettuce.core.SslOptions
 import io.lettuce.core.TimeoutOptions
+import io.lettuce.core.cluster.ClusterClientOptions
 import java.time.Duration
-import java.util.concurrent.TimeUnit
 
 /**
- * Redis configuration for kCelery.
- * Supports standalone, sentinel, and cluster modes.
+ * Sealed hierarchy so illegal states are unrepresentable:
+ * sentinel config can't accidentally appear on a standalone connection, etc.
+ * Common options (timeouts, SSL, client name) live on the base class.
  */
-data class RedisConfig(
-    /** Redis mode */
-    val mode: RedisMode = RedisMode.STANDALONE,
+sealed class RedisConfig {
+    abstract val clientName: String
+    abstract val connectionTimeout: Duration
+    abstract val commandTimeout: Duration
+    abstract val keyPrefix: String
+    abstract val autoReconnect: Boolean
+    abstract val ssl: RedisSslConfig?
 
-    /** Connection URLs */
-    val urls: List<String> = listOf("redis://localhost:6379"),
+    data class Standalone(
+        val url: String = "redis://localhost:6379",
+        val password: String? = null,
+        val database: Int = 0,
+        override val clientName: String = "kcelery",
+        override val connectionTimeout: Duration = Duration.ofSeconds(10),
+        override val commandTimeout: Duration = Duration.ofSeconds(30),
+        override val keyPrefix: String = "celery",
+        override val autoReconnect: Boolean = true,
+        override val ssl: RedisSslConfig? = null
+    ) : RedisConfig()
 
-    /** Password for authentication */
-    val password: String? = null,
-
-    /** Database index (standalone only) */
-    val database: Int = 0,
-
-    /** Client name for identification */
-    val clientName: String = "kcelery",
-
-    /** Connection timeout */
-    val connectionTimeout: Duration = Duration.ofSeconds(10),
-
-    /** Command timeout */
-    val commandTimeout: Duration = Duration.ofSeconds(30),
-
-    /** Key prefix for all Redis keys */
-    val keyPrefix: String = "celery",
-
-    /** SSL configuration */
-    val ssl: RedisSslConfig? = null,
-
-    /** Connection pool settings */
-    val pool: RedisPoolConfig = RedisPoolConfig(),
-
-    /** Read from replica settings */
-    val readFrom: ReadFrom = ReadFrom.MASTER,
-
-    /** Auto-reconnect enabled */
-    val autoReconnect: Boolean = true,
-
-    /** Sentinel configuration (sentinel mode only) */
-    val sentinel: RedisSentinelConfig? = null,
-
-    /** Cluster configuration (cluster mode only) */
-    val cluster: RedisClusterConfig? = null
-) {
-    fun toRedisUri(): String {
-        val builder = StringBuilder("redis")
-        if (ssl != null) builder.append("s")
-        builder.append("://")
-
-        if (password != null) {
-            builder.append(":$password@")
+    data class Sentinel(
+        val masterId: String = "mymaster",
+        val sentinelUrls: List<String>,
+        val password: String? = null,
+        val sentinelPassword: String? = null,
+        val database: Int = 0,
+        // ReadFrom.UPSTREAM replaces deprecated ReadFrom.MASTER
+        val readFrom: ReadFrom = ReadFrom.UPSTREAM,
+        override val clientName: String = "kcelery",
+        override val connectionTimeout: Duration = Duration.ofSeconds(10),
+        override val commandTimeout: Duration = Duration.ofSeconds(30),
+        override val keyPrefix: String = "celery",
+        override val autoReconnect: Boolean = true,
+        override val ssl: RedisSslConfig? = null
+    ) : RedisConfig() {
+        init {
+            require(sentinelUrls.isNotEmpty()) { "At least one sentinel URL required" }
         }
-
-        builder.append(urls.first().removePrefix("redis://").removePrefix("rediss://"))
-
-        if (database > 0) {
-            builder.append("/$database")
-        }
-
-        return builder.toString()
     }
 
-    fun toLettuceClientOptions(): ClientOptions {
-        return ClientOptions.builder()
-            .socketOptions(
-                SocketOptions.builder()
-                    .connectTimeout(connectionTimeout)
-                    .build()
-            )
+    data class Cluster(
+        val urls: List<String>,
+        val password: String? = null,
+        val maxRedirects: Int = 5,
+        val validateClusterNodeMembership: Boolean = true,
+        val readFrom: ReadFrom = ReadFrom.UPSTREAM,
+        override val clientName: String = "kcelery",
+        override val connectionTimeout: Duration = Duration.ofSeconds(10),
+        override val commandTimeout: Duration = Duration.ofSeconds(30),
+        override val keyPrefix: String = "celery",
+        override val autoReconnect: Boolean = true,
+        override val ssl: RedisSslConfig? = null
+    ) : RedisConfig() {
+        init {
+            require(urls.isNotEmpty()) { "At least one cluster node URL required" }
+        }
+    }
+
+    /** Shared Lettuce ClientOptions for standalone and sentinel connections. */
+    fun toClientOptions(): ClientOptions = ClientOptions.builder()
+        .socketOptions(SocketOptions.builder().connectTimeout(connectionTimeout).build())
+        .timeoutOptions(
+            TimeoutOptions.builder()
+                .timeoutCommands(true)
+                .fixedTimeout(commandTimeout)
+                .build()
+        )
+        .autoReconnect(autoReconnect)
+        .apply { ssl?.let { sslOptions(it.toLettuceOptions()) } }
+        .build()
+
+    /** ClusterClientOptions for cluster mode — includes maxRedirects and membership validation. */
+    fun toClusterClientOptions(): ClusterClientOptions {
+        val clusterConfig = this as? Cluster
+        return ClusterClientOptions.builder()
+            .socketOptions(SocketOptions.builder().connectTimeout(connectionTimeout).build())
             .timeoutOptions(
                 TimeoutOptions.builder()
                     .timeoutCommands(true)
@@ -86,14 +96,11 @@ data class RedisConfig(
                     .build()
             )
             .autoReconnect(autoReconnect)
+            .maxRedirects(clusterConfig?.maxRedirects ?: 5)
+            .validateClusterNodeMembership(clusterConfig?.validateClusterNodeMembership ?: true)
+            .apply { ssl?.let { sslOptions(it.toLettuceOptions()) } }
             .build()
     }
-}
-
-enum class RedisMode {
-    STANDALONE,
-    SENTINEL,
-    CLUSTER
 }
 
 data class RedisSslConfig(
@@ -102,26 +109,19 @@ data class RedisSslConfig(
     val truststorePath: String? = null,
     val truststorePassword: String? = null,
     val verifyPeer: Boolean = true
-)
-
-data class RedisPoolConfig(
-    val maxTotal: Int = 8,
-    val maxIdle: Int = 8,
-    val minIdle: Int = 2,
-    val maxWait: Duration = Duration.ofSeconds(10),
-    val testOnBorrow: Boolean = true,
-    val testOnReturn: Boolean = false,
-    val testWhileIdle: Boolean = true,
-    val timeBetweenEvictionRuns: Duration = Duration.ofSeconds(30)
-)
-
-data class RedisSentinelConfig(
-    val masterId: String = "mymaster",
-    val sentinelUrls: List<String>,
-    val sentinelPassword: String? = null
-)
-
-data class RedisClusterConfig(
-    val maxRedirects: Int = 5,
-    val validateClusterNodeMembership: Boolean = true
-)
+) {
+    fun toLettuceOptions(): SslOptions = SslOptions.builder()
+        .apply {
+            if (!verifyPeer) {
+                // Disable hostname verification — use only in dev/test
+                jdkSslProvider()
+            }
+            keystorePath?.let {
+                keystore(java.io.File(it), keystorePassword?.toCharArray() ?: charArrayOf())
+            }
+            truststorePath?.let {
+                truststore(java.io.File(it), truststorePassword ?: "")
+            }
+        }
+        .build()
+}

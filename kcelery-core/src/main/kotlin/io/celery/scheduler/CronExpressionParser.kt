@@ -1,5 +1,10 @@
 package io.celery.scheduler
 
+import kotlinx.serialization.Serializable
+import org.slf4j.LoggerFactory
+import java.time.DayOfWeek
+import java.time.ZonedDateTime
+
 @Serializable
 data class CronExpressionParser(
     val seconds: Set<Int> = setOf(0),
@@ -7,51 +12,48 @@ data class CronExpressionParser(
     val hours: Set<Int> = setOf(0),
     val daysOfMonth: Set<Int> = (1..31).toSet(),
     val months: Set<Int> = (1..12).toSet(),
-    val daysOfWeek: Set<DayOfWeek> = DayOfWeek.entries.toSet()
+    val daysOfWeek: Set<DayOfWeek> = DayOfWeek.entries.toSet(),
+    // Internal trackers to accurately follow traditional Unix/Spring OR semantics
+    val isDayOfMonthRestricted: Boolean = false,
+    val isDayOfWeekRestricted: Boolean = false
 ) {
     fun matches(dateTime: ZonedDateTime): Boolean {
-        return dateTime.second in seconds &&
-                dateTime.minute in minutes &&
-                dateTime.hour in hours &&
-                dateTime.dayOfMonth in daysOfMonth &&
-                dateTime.monthValue in months &&
-                dateTime.dayOfWeek in daysOfWeek
+        if (dateTime.second !in seconds || dateTime.minute !in minutes || dateTime.hour !in hours || dateTime.monthValue !in months) {
+            return false
+        }
+        return isDayValid(dateTime)
     }
 
-    fun nextMatchAfter(dateTime: ZonedDateTime, maxAttempts: Int = 366 * 24 * 60 * 60): ZonedDateTime {
+    fun nextMatchAfter(dateTime: ZonedDateTime, maxAttempts: Int = 100_000): ZonedDateTime {
+        // Enforce strict initialization hygiene for virtual-time frameworks
         var current = dateTime.withNano(0).plusSeconds(1)
         var attempts = 0
 
         while (attempts < maxAttempts) {
-            // Quick skip for invalid months
             if (!months.contains(current.monthValue)) {
                 current = skipToNextMonth(current)
                 attempts++
                 continue
             }
 
-            // Quick skip for invalid days
             if (!isDayValid(current)) {
                 current = current.plusDays(1).withHour(0).withMinute(0).withSecond(0).withNano(0)
                 attempts++
                 continue
             }
 
-            // Quick skip for invalid hours
             if (!hours.contains(current.hour)) {
                 current = skipToNextHour(current)
                 attempts++
                 continue
             }
 
-            // Quick skip for invalid minutes
             if (!minutes.contains(current.minute)) {
                 current = skipToNextMinute(current)
                 attempts++
                 continue
             }
 
-            // Quick skip for invalid seconds
             if (!seconds.contains(current.second)) {
                 current = skipToNextSecond(current)
                 attempts++
@@ -61,22 +63,27 @@ data class CronExpressionParser(
             return current
         }
 
-        throw IllegalStateException("Unable to find next match within $maxAttempts attempts")
+        throw IllegalStateException("Unable to find next cron match within safety limits")
     }
 
     private fun isDayValid(dateTime: ZonedDateTime): Boolean {
-        return daysOfMonth.contains(dateTime.dayOfMonth) &&
-                daysOfWeek.contains(dateTime.dayOfWeek)
+        val domMatch = daysOfMonth.contains(dateTime.dayOfMonth)
+        val dowMatch = daysOfWeek.contains(dateTime.dayOfWeek)
+
+        // Standard Cron Rule: If both fields are restricted, match if EITHER matches (OR logic)
+        if (isDayOfMonthRestricted && isDayOfWeekRestricted) {
+            return domMatch || dowMatch
+        }
+        // Otherwise, default standard strict checking applies
+        return domMatch && dowMatch
     }
 
     private fun skipToNextMonth(current: ZonedDateTime): ZonedDateTime {
         val currentMonth = current.monthValue
         val sortedMonths = months.sorted()
-
-        val nextMonth = sortedMonths.firstOrNull { it > currentMonth }
-            ?: sortedMonths.first()
-
+        val nextMonth = sortedMonths.firstOrNull { it > currentMonth } ?: sortedMonths.first()
         val yearAdjust = if (nextMonth <= currentMonth) 1 else 0
+
         return current
             .plusYears(yearAdjust.toLong())
             .withMonth(nextMonth)
@@ -110,7 +117,8 @@ data class CronExpressionParser(
         return if (nextSecond != null) {
             current.withSecond(nextSecond).withNano(0)
         } else {
-            current.plusMinutes(1).withSecond(seconds.min())
+            // FIX: Chain explicit withNano(0) onto rollover transitions
+            current.plusMinutes(1).withSecond(seconds.min()).withNano(0)
         }
     }
 
@@ -122,21 +130,26 @@ data class CronExpressionParser(
                 "Invalid cron expression: '$expression'. Expected 5 or 6 fields"
             }
 
-            val offset = if (parts.size == 6) 0 else -1
+            val hasSecondsField = parts.size == 6
+            val offset = if (hasSecondsField) 0 else -1
+
+            val domField = parts[3 + offset]
+            val dowField = parts[5 + offset]
 
             return CronExpressionParser(
-                seconds = if (offset == 0) parseField(parts[0], 0..59, "seconds") else setOf(0),
+                seconds = if (hasSecondsField) parseField(parts[0], 0..59, "seconds") else setOf(0),
                 minutes = parseField(parts[1 + offset], 0..59, "minutes"),
                 hours = parseField(parts[2 + offset], 0..23, "hours"),
-                daysOfMonth = parseField(parts[3 + offset], 1..31, "days of month"),
+                daysOfMonth = parseField(domField, 1..31, "days of month"),
                 months = parseField(parts[4 + offset], 1..12, "months"),
-                daysOfWeek = parseDayOfWeekField(parts[5 + offset])
+                daysOfWeek = parseDayOfWeekField(dowField),
+                isDayOfMonthRestricted = domField != "*" && domField != "?",
+                isDayOfWeekRestricted = dowField != "*" && dowField != "?"
             )
         }
 
         private fun parseField(field: String, range: IntRange, fieldName: String): Set<Int> {
             if (field == "*" || field == "?") return range.toSet()
-            if (field == "L") return setOf(range.last)
 
             val values = mutableSetOf<Int>()
             val stepRanges = mutableListOf<Pair<IntRange, Int>>()
@@ -155,8 +168,12 @@ data class CronExpressionParser(
                     val (start, end) = rangePart.split("-").map { it.toInt() }
                     require(start <= end) { "Invalid range in $fieldName: $start-$end" }
                     stepRanges.add((start..end) to (step ?: 1))
-                } else if (rangePart.contains("L")) {
-                    step?.let { values.add(range.last) }
+                } else if (rangePart == "L") {
+                    // FIX: Direct reference evaluation adds the upper bound correctly regardless of step state
+                    values.add(range.last)
+                    step?.let {
+                        logger.warn("Step syntax combined with 'L' is unsupported for $fieldName")
+                    }
                 } else {
                     val num = rangePart.toIntOrNull()
                         ?: throw IllegalArgumentException("Invalid number in $fieldName: $rangePart")
@@ -171,7 +188,7 @@ data class CronExpressionParser(
                 }
             }
 
-            require(values.isNotEmpty()) { "No valid values for $fieldName" }
+            require(values.isNotEmpty()) { "No valid values extracted for field $fieldName" }
             return values
         }
 
@@ -207,8 +224,7 @@ data class CronExpressionParser(
                     part.contains("/") -> {
                         val (rangePart, stepStr) = part.split("/")
                         val step = stepStr.toInt()
-                        val startDay = if (rangePart == "*") DayOfWeek.MONDAY
-                        else parseDayValue(rangePart, dayMap)
+                        val startDay = if (rangePart == "*") DayOfWeek.MONDAY else parseDayValue(rangePart, dayMap)
                         var current = startDay
                         repeat(7 / step) {
                             values.add(current)
@@ -225,10 +241,14 @@ data class CronExpressionParser(
         }
 
         private fun parseDayValue(value: String, dayMap: Map<String, DayOfWeek>): DayOfWeek {
+            val upperValue = value.uppercase()
             return value.toIntOrNull()?.let {
+                // Safeguard input integers down to official JVM bounds safely
+                require(it in 0..7) { "Invalid integer day of week boundary: $it" }
                 DayOfWeek.of(if (it == 0) 7 else it)
-            } ?: dayMap[value.uppercase()]
-            ?: throw IllegalArgumentException("Invalid day of week: $value")
+            } ?: dayMap[upperValue] ?: throw IllegalArgumentException("Invalid day of week text token: $value")
         }
+
+        private val logger = LoggerFactory.getLogger(CronExpressionParser::class.java)
     }
 }
