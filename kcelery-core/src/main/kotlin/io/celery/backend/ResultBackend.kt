@@ -1,5 +1,7 @@
 package io.celery.backend
 
+import io.celery.deadletter.InstantSerializer
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import java.time.Instant
 import kotlin.time.Duration
@@ -84,6 +86,7 @@ interface ResultBackend {
 /**
  * Task result representation.
  */
+@Serializable
 data class TaskResult(
     /** Task ID */
     val taskId: String,
@@ -104,6 +107,7 @@ data class TaskResult(
     val errorType: String? = null,
 
     /** When the task completed */
+    @Serializable(with = InstantSerializer::class)
     val completedAt: Instant? = null,
 
     /** Worker that executed the task */

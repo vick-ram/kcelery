@@ -2,7 +2,8 @@ package io.celery.broker
 
 import io.celery.task.TaskMessage
 import kotlinx.coroutines.flow.Flow
-import kotlin.time.Duration
+import java.time.Duration
+import java.time.Instant
 
 /**
  * Message broker record containing the consumed message.
@@ -24,7 +25,7 @@ data class BrokerRecord(
     val consumer: String,
 
     /** When the message was received */
-    val receivedAt: kotlinx.datetime.Instant = kotlinx.datetime.Clock.System.now()
+    val receivedAt: Instant = Instant.now()
 )
 
 /**
@@ -56,7 +57,7 @@ interface MessageBroker {
         consumerGroup: String,
         consumerName: String,
         batchSize: Int = 10,
-        pollTimeout: Duration = Duration.seconds(5)
+        pollTimeout: Duration = Duration.ofSeconds(5)
     ): Flow<BrokerRecord>
 
     /**

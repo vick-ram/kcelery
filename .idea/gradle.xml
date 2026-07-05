@@ -8,8 +8,8 @@
         <option name="modules">
           <set>
             <option value="$PROJECT_DIR$" />
-            <option value="$PROJECT_DIR$/examples" />
             <option value="$PROJECT_DIR$/kcelery-core" />
+            <option value="$PROJECT_DIR$/kcelery-examples" />
             <option value="$PROJECT_DIR$/kcelery-metrics" />
             <option value="$PROJECT_DIR$/kcelery-redis" />
           </set>

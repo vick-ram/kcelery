@@ -5,6 +5,7 @@ import io.celery.broker.MessageBroker
 import io.celery.backend.ResultBackend
 import io.celery.task.CeleryTask
 import kotlinx.coroutines.*
+import kotlinx.coroutines.time.withTimeout
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
@@ -278,21 +279,21 @@ class WorkerPool(
         // Scale up if queue is growing
         if (totalQueueSize > config.scaleUpThreshold && currentWorkers < config.maxWorkers) {
             val toAdd = minOf(
-                config.scaleUpIncrement,
+                config.scaleUpIncrement.toInt(),
                 config.maxWorkers - currentWorkers
             )
             logger.info("Auto-scaling UP: adding $toAdd workers (queue size: $totalQueueSize)")
-            repeat(toAdd.toInt()) { startWorker() }
+            repeat(toAdd) { startWorker() }
         }
 
         // Scale down if queue is small
         if (totalQueueSize < config.scaleDownThreshold && currentWorkers > config.minWorkers) {
             val toRemove = minOf(
-                config.scaleDownIncrement,
+                config.scaleDownIncrement.toInt(),
                 currentWorkers - config.minWorkers
             )
             logger.info("Auto-scaling DOWN: removing $toRemove workers (queue size: $totalQueueSize)")
-            repeat(toRemove.toInt()) { stopWorker() }
+            repeat(toRemove) { stopWorker() }
         }
     }
 

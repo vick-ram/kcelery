@@ -33,10 +33,10 @@ class RedisResultBackend(
         result: TaskResult,
         expiry: Duration
     ) {
-        val commands = connectionFactory.getCommands()
         val key = resultKey(taskId)
 
         try {
+            connectionFactory.withCommands { commands ->
             val resultJson = json.encodeToString(result)
             commands.set(key, resultJson)
 
@@ -46,12 +46,14 @@ class RedisResultBackend(
 
             // Also update status set for faster lookups
             if (result.status.isTerminal()) {
-                commands.zadd(completedKey(),
+                commands.zadd(
+                    completedKey(),
                     result.completedAt?.toEpochMilli()?.toDouble()
                         ?: java.time.Instant.now().toEpochMilli().toDouble(),
                     taskId
                 )
             }
+        }
 
             logger.debug("Stored result for task: $taskId (${result.status})")
 
@@ -65,15 +67,16 @@ class RedisResultBackend(
      * Get a task result.
      */
     override suspend fun getResult(taskId: String): TaskResult? {
-        val commands = connectionFactory.getCommands()
         val key = resultKey(taskId)
 
         return try {
-            val resultJson = commands.get(key)
-            if (resultJson != null) {
-                json.decodeFromString<TaskResult>(resultJson)
-            } else {
-                null
+            connectionFactory.withCommands { commands ->
+                val resultJson = commands.get(key)
+                if (resultJson != null) {
+                    json.decodeFromString<TaskResult>(resultJson)
+                } else {
+                    null
+                }
             }
         } catch (e: Exception) {
             logger.error("Failed to get result for task: $taskId", e)
@@ -92,13 +95,13 @@ class RedisResultBackend(
      * Revoke/cancel a task.
      */
     override suspend fun revokeTask(taskId: String) {
-        val commands = connectionFactory.getCommands()
         val key = revokedKey(taskId)
 
         try {
-            commands.set(key, "1")
-            commands.expire(key, config.revokedTtl.inWholeSeconds)
-
+            connectionFactory.withCommands { commands ->
+                commands.set(key, "1")
+                commands.expire(key, config.revokedTtl.inWholeSeconds)
+            }
             logger.info("Revoked task: $taskId")
 
         } catch (e: Exception) {
@@ -110,9 +113,9 @@ class RedisResultBackend(
      * Check if a task is revoked.
      */
     override suspend fun isRevoked(taskId: String): Boolean {
-        val commands = connectionFactory.getCommands()
         return try {
-            (commands.exists(revokedKey(taskId)) ?:0L) > 0
+            connectionFactory.withCommands { commands ->
+            (commands.exists(revokedKey(taskId)) ?:0L) > 0  }
         } catch (e: Exception) {
             logger.error("Failed to check revoked status for task: $taskId", e)
             false
@@ -123,10 +126,11 @@ class RedisResultBackend(
      * Delete a task result.
      */
     override suspend fun deleteResult(taskId: String) {
-        val commands = connectionFactory.getCommands()
         try {
+            connectionFactory.withCommands { commands ->
             commands.del(resultKey(taskId), revokedKey(taskId))
             commands.zrem(completedKey(), taskId)
+        }
             logger.debug("Deleted result for task: $taskId")
         } catch (e: Exception) {
             logger.error("Failed to delete result for task: $taskId", e)
@@ -139,14 +143,14 @@ class RedisResultBackend(
     override suspend fun getResults(taskIds: List<String>): Map<String, TaskResult?> {
         if (taskIds.isEmpty()) return emptyMap()
 
-        val commands = connectionFactory.getCommands()
         val keys = taskIds.map(::resultKey)
 
         return try {
+            connectionFactory.withCommands { commands ->
             val results = commands.mget(*keys.toTypedArray()).toList()
             taskIds.zip(results.map { kv ->
                 kv.value?.let { json.decodeFromString<TaskResult>(it) }
-            }).toMap()
+            }).toMap() }
         } catch (e: Exception) {
             logger.error("Failed to get multiple results", e)
             taskIds.associateWith { null }
@@ -160,9 +164,9 @@ class RedisResultBackend(
         limit: Long = 100,
         offset: Long = 0
     ): List<String> {
-        val commands = connectionFactory.getCommands()
         return try {
-            commands.zrevrange(completedKey(), offset, offset + limit - 1).toList()
+            connectionFactory.withCommands { commands ->
+            commands.zrevrange(completedKey(), offset, offset + limit - 1).toList() }
         } catch (e: Exception) {
             logger.error("Failed to get completed tasks", e)
             emptyList()
@@ -173,10 +177,10 @@ class RedisResultBackend(
      * Clean up expired results.
      */
     suspend fun cleanupExpired(batchSize: Int = 100): Int {
-        val commands = connectionFactory.getCommands()
         var cleaned = 0
 
         try {
+            connectionFactory.withCommands { commands ->
             // Clean revoked keys
             val revokedKeys = commands.keys("${config.keyPrefix}:revoked:*")
             revokedKeys.collect { key ->
@@ -197,6 +201,7 @@ class RedisResultBackend(
                     cutoff.toEpochMilli()
                 )
             )
+        }
 
             logger.debug("Cleaned $cleaned expired results")
 

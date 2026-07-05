@@ -1,5 +1,6 @@
 package io.celery.task
 
+import io.celery.deadletter.InstantSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.decodeFromJsonElement
@@ -18,9 +19,11 @@ data class TaskContext(
     val taskName: String,
 
     /** When the task was scheduled/originated */
+    @Serializable(with = InstantSerializer::class)
     val originTime: Instant = Instant.now(),
 
     /** When the task execution started */
+    @Serializable(with = InstantSerializer::class)
     val executionTime: Instant = Instant.now(),
 
     /** Current retry attempt (0-based) */
@@ -51,6 +54,7 @@ data class TaskContext(
     val headers: Map<String, String> = emptyMap(),
 
     /** When the task expires (null = no expiry) */
+    @Serializable(with = InstantSerializer::class)
     val expiresAt: Instant? = null,
 
     /** Parent task ID if this is a child task */

@@ -1,14 +1,16 @@
 package io.celery.worker
 
-import io.celery.broker.BrokerRecord
-import io.celery.broker.MessageBroker
 import io.celery.backend.ResultBackend
 import io.celery.backend.ResultStatus
 import io.celery.backend.TaskResult
+import io.celery.broker.BrokerRecord
+import io.celery.broker.MessageBroker
 import io.celery.task.CeleryTask
+import io.celery.task.TaskConfig
 import io.celery.task.TaskContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.time.Instant
@@ -16,6 +18,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -59,10 +62,14 @@ class Worker(
     private val tasksFailed = AtomicInteger(0)
     private val tasksRetried = AtomicInteger(0)
 
+    /** Check if the worker is currently running and accepting tasks */
+    val isActive: Boolean
+        get() = isRunning.get() && scope.isActive
+
     /**
      * Start the worker.
      */
-    suspend fun start() {
+    fun start() {
         if (!isRunning.compareAndSet(false, true)) {
             logger.warn("Worker $name already running")
             return
@@ -140,7 +147,7 @@ class Worker(
                         processRecord(record, consumerName)
                     }
                 }
-            } catch (e: CancellationException) {
+            } catch (_: CancellationException) {
                 // Normal shutdown
             } catch (e: Exception) {
                 logger.error("Consumer $consumerName failed", e)
@@ -175,24 +182,77 @@ class Worker(
         }
     }
 
+    private suspend fun <T : Any> executeSafely(
+        task: CeleryTask<T>,
+        context: TaskContext,
+        record: BrokerRecord
+    ) {
+        val taskId = context.taskId
+        val taskName = task.name
+
+        backend?.storeResult(
+            taskId,
+            TaskResult(taskId = taskId, status = ResultStatus.STARTED, worker = name)
+        )
+
+        try {
+            val result = withTimeout(task.executionTimeout) {
+                task.beforeRun(context)
+                val r = task.run(context)
+                task.onSuccess(context, r)  // inside timeout, before ack — if it throws, we handle it
+                task.afterRun(context)
+                r
+            }
+
+            tasksProcessed.incrementAndGet()
+            if (task.autoAck) broker.ack(record)
+
+            backend?.storeResult(
+                taskId,
+                TaskResult(
+                    taskId      = taskId,
+                    status      = ResultStatus.SUCCESS,
+                    result      = json.encodeToJsonElement(task.serializer, result),
+                    completedAt = Instant.now(),
+                    worker      = name
+                )
+            )
+            logger.debug("Task completed: $taskName [$taskId]")
+
+        } catch (e: TimeoutCancellationException) {
+            // Must come before CancellationException — it's a subclass and would
+            // be swallowed by the broader catch if the order were reversed.
+            logger.warn("Task timed out: $taskName [$taskId]")
+            handleTaskFailure(task, context, record, e)
+
+        } catch (e: CancellationException) {
+            // Structured cancellation (worker shutdown, scope cancel) — don't retry
+            broker.nack(record, requeue = false)
+            backend?.storeResult(
+                taskId,
+                TaskResult(taskId = taskId, status = ResultStatus.REVOKED, worker = name)
+            )
+            throw e  // must rethrow so structured concurrency propagates correctly
+
+        } catch (e: Exception) {
+            logger.error("Task failed: $taskName [$taskId]", e)
+            handleTaskFailure(task, context, record, e)
+        }
+    }
+
     private suspend fun executeTask(record: BrokerRecord, consumerName: String) {
         val taskMessage = record.payload
-        val taskId = taskMessage.id
-        val taskName = taskMessage.taskName
+        val taskId      = taskMessage.id
+        val taskName    = taskMessage.taskName
 
         logger.debug("Executing task: $taskName [$taskId]")
 
-        // Check if task is revoked
         if (backend?.isRevoked(taskId) == true) {
             logger.info("Task $taskId is revoked, skipping")
             broker.ack(record)
             backend.storeResult(
                 taskId,
-                TaskResult(
-                    taskId = taskId,
-                    status = ResultStatus.REVOKED,
-                    worker = name
-                )
+                TaskResult(taskId = taskId, status = ResultStatus.REVOKED, worker = name)
             )
             return
         }
@@ -204,81 +264,17 @@ class Worker(
             backend?.storeResult(
                 taskId,
                 TaskResult(
-                    taskId = taskId,
-                    status = ResultStatus.REJECTED,
-                    error = "Unknown task: $taskName",
+                    taskId    = taskId,
+                    status    = ResultStatus.REJECTED,
+                    error     = "Unknown task: $taskName",
                     errorType = "UnknownTaskException",
-                    worker = name
+                    worker    = name
                 )
             )
             return
         }
 
-        val context = taskMessage.toTaskContext(consumerName)
-
-        // Store PENDING status
-        backend?.storeResult(
-            taskId,
-            TaskResult(
-                taskId = taskId,
-                status = ResultStatus.STARTED,
-                worker = name
-            )
-        )
-
-        try {
-            // Execute with timeout
-            val result = withTimeout(task.maxRetries.seconds) {
-                task.beforeRun(context)
-                val result = task.run(context)
-                task.afterRun(context)
-                result
-            }
-
-            // Success
-            tasksProcessed.incrementAndGet()
-
-            if (task.autoAck) {
-                broker.ack(record)
-            }
-
-            backend?.storeResult(
-                taskId,
-                TaskResult(
-                    taskId = taskId,
-                    status = ResultStatus.SUCCESS,
-                    result = json.encodeToJsonElement(task.serializer, result),
-                    completedAt = Instant.now(),
-                    worker = name
-                )
-            )
-
-            task.onSuccess(context, result)
-            logger.debug("Task completed: $taskName [$taskId]")
-
-        } catch (e: CancellationException) {
-            // Task was revoked
-            broker.nack(record, requeue = false)
-            backend?.storeResult(
-                taskId,
-                TaskResult(
-                    taskId = taskId,
-                    status = ResultStatus.REVOKED,
-                    worker = name
-                )
-            )
-            throw e
-
-        } catch (e: TimeoutCancellationException) {
-            // Task timed out
-            logger.warn("Task timed out: $taskName [$taskId]")
-            handleTaskFailure(task, context, record, e)
-
-        } catch (e: Exception) {
-            // Task failed
-            logger.error("Task failed: $taskName [$taskId]", e)
-            handleTaskFailure(task, context, record, e)
-        }
+        executeSafely(task, taskMessage.toTaskContext(consumerName), record)
     }
 
     private suspend fun handleTaskFailure(
@@ -289,9 +285,10 @@ class Worker(
     ) {
         val taskId = record.payload.id
 
-        if (exception is Exception && task.isRetryable(exception) &&
-            RetryPolicy.shouldRetry(TaskConfig(maxRetries = task.maxRetries),
-                context.attempt, exception)) {
+        if (task.isRetryable(exception) && RetryPolicy.shouldRetry(
+                TaskConfig(maxRetries = task.maxRetries),
+                context.attempt, exception)
+        ) {
 
             // Retry
             tasksRetried.incrementAndGet()

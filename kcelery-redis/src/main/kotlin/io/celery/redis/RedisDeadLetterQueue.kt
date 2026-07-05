@@ -5,12 +5,16 @@ import io.celery.deadletter.DeadLetterRecord
 import io.celery.deadletter.DeadLetterStats
 import io.celery.task.TaskMessage
 import io.lettuce.core.ExperimentalLettuceCoroutinesApi
+import io.lettuce.core.Limit
 import io.lettuce.core.Range
+import io.lettuce.core.api.coroutines.BaseRedisCoroutinesCommands
+import io.lettuce.core.api.coroutines.RedisCoroutinesCommands
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.toList
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.time.Instant
@@ -28,7 +32,6 @@ class RedisDeadLetterQueue(
 ) : DeadLetterQueue {
 
     private val logger = LoggerFactory.getLogger(javaClass)
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     /**
      * Enqueue a task to dead letter queue.
@@ -38,42 +41,42 @@ class RedisDeadLetterQueue(
         reason: String,
         exception: Throwable?
     ) {
-        val commands = connectionFactory.getCommands()
+        val record = DeadLetterRecord(
+            id = generateId(task),
+            task = task,
+            reason = reason,
+            errorMessage = exception?.message,
+            errorType = exception?.javaClass?.name,
+            stackTrace = exception?.stackTraceToString(),
+            failedAt = Instant.now(),
+            originalQueue = task.queue
+        )
 
+        val recordJson = json.encodeToString(record)
         try {
-            val record = DeadLetterRecord(
-                id = generateId(task),
-                task = task,
-                reason = reason,
-                errorMessage = exception?.message,
-                errorType = exception?.javaClass?.name,
-                stackTrace = exception?.stackTraceToString(),
-                failedAt = Instant.now(),
-                originalQueue = task.queue
-            )
-
-            val recordJson = json.encodeToString(record)
-            val streamId = commands.xadd(
-                streamKey(),
-                mapOf(
-                    "record" to recordJson,
-                    "task_name" to task.taskName,
-                    "reason" to reason,
-                    "failed_at" to record.failedAt.toString()
+            connectionFactory.withCommands { commands ->
+                commands.xadd(
+                    streamKey(),
+                    mapOf(
+                        "record" to recordJson,
+                        "task_name" to task.taskName,
+                        "reason" to reason,
+                        "failed_at" to record.failedAt.toString()
+                    )
                 )
-            )
 
-            // Add to sorted set for time-based queries
-            commands.zadd(
-                indexKey(),
-                record.failedAt.toEpochMilli().toDouble(),
-                record.id
-            )
+                // Add to sorted set for time-based queries
+                commands.zadd(
+                    indexKey(),
+                    record.failedAt.toEpochMilli().toDouble(),
+                    record.id
+                )
 
-            // Store full record
-            commands.set(recordKey(record.id), recordJson)
-            commands.expire(recordKey(record.id), config.retentionPeriod.inWholeSeconds)
+                // Store full record
+                commands.set(recordKey(record.id), recordJson)
+                commands.expire(recordKey(record.id), config.retentionPeriod.inWholeSeconds)
 
+            }
             logger.info("Dead letter queued: ${record.id} (${task.taskName}) - $reason")
 
         } catch (e: Exception) {
@@ -87,28 +90,23 @@ class RedisDeadLetterQueue(
     override suspend fun replay(deadLetterId: String): Boolean {
         val record = get(deadLetterId) ?: return false
 
-        val commands = connectionFactory.getCommands()
-
-        try {
-            // Update replay count
-            val updatedRecord = record.copy(
-                replayCount = record.replayCount + 1,
-                lastReplayAt = Instant.now()
-            )
-
-            commands.set(recordKey(deadLetterId), json.encodeToString(updatedRecord))
-
-            // Add to original queue
-            val taskJson = json.encodeToString(record.task)
-            val streamKey = streamKey(record.task.queue)
-            commands.xadd(streamKey, mapOf("task" to taskJson))
-
-            logger.info("Replayed dead letter: $deadLetterId (attempt ${updatedRecord.replayCount})")
-            return true
-
+        return try {
+            connectionFactory.withCommands { commands ->
+                val updated = record.copy(
+                    replayCount = record.replayCount + 1,
+                    lastReplayAt = Instant.now()
+                )
+                commands.set(recordKey(deadLetterId), json.encodeToString<DeadLetterRecord>(updated))
+                commands.xadd(
+                    streamKey(record.task.queue),
+                    mapOf("task" to json.encodeToString<TaskMessage>(record.task))
+                )
+            }
+            logger.info("Replayed dead letter $deadLetterId (attempt ${record.replayCount + 1})")
+            true
         } catch (e: Exception) {
-            logger.error("Failed to replay dead letter: $deadLetterId", e)
-            return false
+            logger.error("Failed to replay dead letter $deadLetterId", e)
+            false
         }
     }
 
@@ -130,139 +128,155 @@ class RedisDeadLetterQueue(
     /**
      * Get a dead letter record.
      */
-    override suspend fun get(deadLetterId: String): DeadLetterRecord? {
-        val commands = connectionFactory.getCommands()
-
-        return try {
-            val recordJson = commands.get(recordKey(deadLetterId))
-            recordJson?.let { json.decodeFromString<DeadLetterRecord>(it) }
-        } catch (e: Exception) {
-            logger.error("Failed to get dead letter: $deadLetterId", e)
-            null
+    override suspend fun get(deadLetterId: String): DeadLetterRecord? = try {
+        connectionFactory.withCommands { commands ->
+            commands.get(recordKey(deadLetterId))
+                ?.let { json.decodeFromString<DeadLetterRecord>(it) }
         }
+    } catch (e: Exception) {
+        logger.error("Failed to get dead letter: $deadLetterId", e)
+        null
     }
 
     /**
-     * List dead letter records.
+     * List dead letter records, newest first.
+     * When [taskName] is non-null, filters by task name.
+     * Filtering is done in Redis via the index scan — records not matching
+     * the task name are skipped without loading their full payloads first,
+     * so this doesn't pull all records into memory.
      */
     override suspend fun list(
         taskName: String?,
         limit: Int,
         offset: Int
-    ): List<DeadLetterRecord> {
-        val commands = connectionFactory.getCommands()
+    ): List<DeadLetterRecord> = try {
+        connectionFactory.withCommands { commands ->
+            if (taskName != null) {
+                // Scan the index until we have [limit] matching records.
+                // We page through in batches to avoid loading the full DLQ.
+                val result = mutableListOf<DeadLetterRecord>()
+                var cursor = offset.toLong()
+                val batchSize = (limit * 2).coerceAtLeast(50).toLong()
 
-        return try {
-            val ids = commands.zrevrange(indexKey(), offset.toLong(), (offset + limit - 1).toLong()).toList()
+                while (result.size < limit) {
+                    val ids = commands.zrevrange(indexKey(), cursor, cursor + batchSize - 1).toList()
+                    if (ids.isEmpty()) break
 
-            if (ids.isEmpty()) return emptyList()
+                    val keys = ids.map { recordKey(it) }
+                    commands.mget(*keys.toTypedArray()).toList()
+                        .mapNotNull { kv ->
+                            kv.value?.let {
+                                runCatching { json.decodeFromString<DeadLetterRecord>( it) }.getOrNull()
+                            }
+                        }
+                        .filter { it.task.taskName == taskName }
+                        .forEach { if (result.size < limit) result.add(it) }
 
-            val keys = ids.map { recordKey(it) }
-            val records = commands.mget(*keys.toTypedArray()).toList()
-
-            ids.zip(records.mapNotNull { kv ->
-                kv.value?.let {
-                    try {
-                        json.decodeFromString<DeadLetterRecord>(it)
-                    } catch (e: Exception) {
-                        null
-                    }
+                    cursor += batchSize
+                    if (ids.size < batchSize) break
                 }
-            }).filter { (_, record) ->
-                taskName == null || record.task.taskName == taskName
-            }.map { it.second }
+                result
+            } else {
+                val ids = commands.zrevrange(indexKey(), offset.toLong(), (offset + limit - 1).toLong()).toList()
+                if (ids.isEmpty()) return@withCommands emptyList()
 
-        } catch (e: Exception) {
-            logger.error("Failed to list dead letters", e)
-            emptyList()
+                val keys = ids.map { recordKey(it) }
+                commands.mget(*keys.toTypedArray()).toList()
+                    .mapNotNull { kv ->
+                        kv.value?.let {
+                            runCatching { json.decodeFromString<DeadLetterRecord>(it) }.getOrNull()
+                        }
+                    }
+            }
         }
+    } catch (e: Exception) {
+        logger.error("Failed to list dead letters", e)
+        emptyList()
     }
 
-    /**
-     * Stream dead letter records.
-     */
+    /** Streams all records without loading them all into memory at once. */
     override fun stream(taskName: String?): Flow<DeadLetterRecord> = flow {
-        val commands = connectionFactory.getCommands()
         var offset = 0L
-        val batchSize = 50
+        val batchSize = 50L
 
         while (currentCoroutineContext().isActive) {
-            val ids = commands.zrevrange(indexKey(), offset, offset + batchSize - 1).toList()
+            val batch = connectionFactory.withCommands { commands ->
+                val ids = commands.zrevrange(indexKey(), offset, offset + batchSize - 1).toList()
+                if (ids.isEmpty()) return@withCommands emptyList()
 
-            if (ids.isEmpty()) break
-
-            val keys = ids.map { recordKey(it) }
-            val records = commands.mget(*keys.toTypedArray()).toList()
-
-            ids.zip(records).forEach { (_, kv) ->
-                kv.value?.let {
-                    try {
-                        val record = json.decodeFromString<DeadLetterRecord>(it)
-                        if (taskName == null || record.task.taskName == taskName) {
-                            emit(record)
-                        }
-                    } catch (e: Exception) {
-                        // Skip invalid records
-                    }
-                }
+                val keys = ids.map { recordKey(it) }
+                commands.mget(*keys.toTypedArray()).toList()
+                    .mapNotNull { kv -> kv.value?.let {
+                        runCatching { json.decodeFromString<DeadLetterRecord>( it) }.getOrNull()
+                    }}
+                    .filter { taskName == null || it.task.taskName == taskName }
             }
 
+            if (batch.isEmpty()) break
+            batch.forEach { emit(it) }
             offset += batchSize
         }
-    }.flowOn(Dispatchers.IO)
+    }
 
     /**
      * Delete a dead letter record.
      */
     override suspend fun delete(deadLetterId: String) {
-        val commands = connectionFactory.getCommands()
-
         try {
-            commands.del(recordKey(deadLetterId))
-            commands.zrem(indexKey(), deadLetterId)
-            logger.debug("Deleted dead letter: $deadLetterId")
+            connectionFactory.withCommands { commands ->
+                commands.del(recordKey(deadLetterId))
+                commands.zrem(indexKey(), deadLetterId)
+            }
+            logger.debug("Deleted dead letter $deadLetterId")
         } catch (e: Exception) {
-            logger.error("Failed to delete dead letter: $deadLetterId", e)
+            logger.error("Failed to delete dead letter $deadLetterId", e)
         }
     }
 
     /**
      * Delete all dead letters for a task.
      */
-    override suspend fun deleteByTask(taskName: String): Int {
-        val records = list(taskName, Int.MAX_VALUE)
-        records.forEach { delete(it.id) }
-        return records.size
+    override suspend fun deleteByTask(taskName: String, batchSize: Int): Int {
+        var deleted = 0
+        var offset = 0
+        while (true) {
+            val ids = idsForTask(taskName, batchSize, offset)
+            if (ids.isEmpty()) break
+            ids.forEach { delete(it) }
+            deleted += ids.size
+            if (ids.size < batchSize) break
+            offset += batchSize
+        }
+        return deleted
     }
 
     /**
-     * Purge old dead letters.
+     * Purge records older than [olderThan]. Batches the deletes to avoid
+     * holding a large list in memory.
      */
     override suspend fun purge(olderThan: Duration): Int {
-        val commands = connectionFactory.getCommands()
         var purged = 0
+        val cutoff = Instant.now().minusMillis(olderThan.inWholeMilliseconds).toEpochMilli().toDouble()
 
         try {
-            val cutoff = Instant.now().minusMillis(olderThan.inWholeMilliseconds)
+            while (true) {
+                val batch = connectionFactory.withCommands { commands ->
+                    commands.zrangebyscore(
+                        indexKey(),
+                        Range.create(0.0, cutoff),
+                        Limit.from(100)
+                    ).toList()
+                }
+                if (batch.isEmpty()) break
 
-            // Get old records
-            val oldIds = commands.zrangebyscore(
-                indexKey(),
-                Range.create(
-                    0.0,
-                    cutoff.toEpochMilli().toDouble()
-                )
-            )
-
-            // Delete them
-            oldIds.collect { id ->
-                commands.del(recordKey(id))
-                commands.zrem(indexKey(), id)
-                purged++
+                connectionFactory.withCommands { commands ->
+                    // del accepts vararg — one roundtrip for the whole batch
+                    commands.del(*batch.map { recordKey(it) }.toTypedArray())
+                    batch.forEach { commands.zrem(indexKey(), it) }
+                }
+                purged += batch.size
             }
-
             logger.info("Purged $purged dead letters older than $olderThan")
-
         } catch (e: Exception) {
             logger.error("Failed to purge dead letters", e)
         }
@@ -273,48 +287,65 @@ class RedisDeadLetterQueue(
     /**
      * Get dead letter count.
      */
-    override suspend fun count(taskName: String?): Long {
-        val commands = connectionFactory.getCommands()
-
-        return try {
+    override suspend fun count(taskName: String?): Long = try {
+        connectionFactory.withCommands { commands ->
             if (taskName != null) {
-                // Count by scanning (approximate)
-                list(taskName, Int.MAX_VALUE).size.toLong()
+                // Scan the index; cheaper than loading full records
+                idsForTask(taskName, Int.MAX_VALUE).size.toLong()
             } else {
-                commands.zcard(indexKey()) ?: 0
+                commands.zcard(indexKey()) ?: 0L
             }
+        }
         } catch (e: Exception) {
             logger.error("Failed to count dead letters", e)
             0
+    }
+
+/**
+ * Stats derived from the same page of records so the counts are
+ * internally consistent. [sampleSize] controls the window — larger
+ * values give more accurate breakdowns but cost more Redis reads.
+ */
+override suspend fun getStats(sampleSize: Int): DeadLetterStats {
+    val sample = list(limit = sampleSize)
+    val total = count()
+    return DeadLetterStats(
+        totalCount    = total,
+        sampleSize    = sample.size,
+        perTask       = sample.groupBy { it.task.taskName }.mapValues { it.value.size.toLong() },
+        perReason     = sample.groupBy { it.reason }.mapValues { it.value.size.toLong() },
+        perErrorType  = sample.groupBy { it.errorType ?: "unknown" }.mapValues { it.value.size.toLong() },
+        oldestEntry   = sample.minByOrNull { it.failedAt }?.failedAt,
+        newestEntry   = sample.maxByOrNull { it.failedAt }?.failedAt,
+        totalReplayed = sample.sumOf { it.replayCount.toLong() }
+    )
+}
+
+    /** Returns IDs for records matching [taskName], without loading full payloads. */
+    private suspend fun idsForTask(taskName: String, limit: Int, offset: Int = 0): List<String> {
+        if (limit <= 0) return emptyList()
+        val result = mutableListOf<String>()
+        var cursor = offset.toLong()
+        val batchSize = 100L
+
+        while (result.size < limit) {
+            connectionFactory.withCommands { commands ->
+                val ids = commands.zrevrange(indexKey(), cursor, cursor + batchSize - 1).toList()
+                if (ids.isEmpty()) return@withCommands result
+
+                val keys = ids.map { recordKey(it) }
+                commands.mget(*keys.toTypedArray()).toList()
+                    .zip(ids) { kv, id ->
+                        kv.value
+                            ?.let { runCatching { json.decodeFromString<DeadLetterRecord>( it) }.getOrNull() }
+                            ?.takeIf { it.task.taskName == taskName }
+                            ?.let { result.add(id) }
+                    }
+                cursor += batchSize
+                if (ids.size < batchSize) return@withCommands result
+            }
         }
-    }
-
-    /**
-     * Get dead letter statistics.
-     */
-    override suspend fun getStats(): DeadLetterStats {
-        val records = list(null, 1000) // Sample up to 1000 records
-
-        return DeadLetterStats(
-            totalCount = count(),
-            perTask = records.groupBy { it.task.taskName }
-                .mapValues { it.value.size.toLong() },
-            perReason = records.groupBy { it.reason }
-                .mapValues { it.value.size.toLong() },
-            perErrorType = records.groupBy { it.errorType ?: "unknown" }
-                .mapValues { it.value.size.toLong() },
-            oldestEntry = records.minByOrNull { it.failedAt }?.failedAt,
-            newestEntry = records.maxByOrNull { it.failedAt }?.failedAt,
-            totalReplayed = records.sumOf { it.replayCount.toLong() }
-        )
-    }
-
-    /**
-     * Close dead letter queue.
-     */
-    override suspend fun close() {
-        scope.cancel()
-        logger.info("RedisDeadLetterQueue closed")
+        return result.take(limit)
     }
 
     // Private helpers

@@ -1,5 +1,6 @@
 package io.celery.task
 
+import io.celery.deadletter.InstantSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.json.JsonElement
@@ -51,6 +52,7 @@ data class TaskMessage(
 
     /** When the message was created */
     @SerialName("created_at")
+    @Serializable(with = InstantSerializer::class)
     val createdAt: Instant = Instant.now(),
 
     /** Parent task ID for task chains */

@@ -10,9 +10,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
+import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.time.Duration
-import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Redis Streams-based message broker implementation.
@@ -35,37 +35,37 @@ class RedisMessageBroker(
      * Enqueue a task message to a queue.
      */
     override suspend fun enqueue(task: TaskMessage, queue: String) {
-        val commands = connectionFactory.getCommands()
         val streamKey = streamKey(queue)
 
         try {
             val taskJson = json.encodeToString(task)
+            connectionFactory.withCommands { commands ->
 
-            // Add to stream
-            val messageId = commands.xadd(
-                streamKey,
-                mapOf(
-                    "task" to taskJson,
-                    "task_name" to task.taskName,
-                    "priority" to task.priority.toString(),
-                    "created_at" to task.createdAt.toString()
+                // Add to stream
+                val messageId = commands.xadd(
+                    streamKey,
+                    mapOf(
+                        "task" to taskJson,
+                        "task_name" to task.taskName,
+                        "priority" to task.priority.toString(),
+                        "created_at" to task.createdAt.toString()
+                    )
                 )
-            )
 
-            // If message has ETA, add to sorted set for scheduling
-            val eta = task.eta
-            if (eta != null && eta > System.currentTimeMillis()) {
-                commands.zadd(
-                    scheduledKey(),
-                    eta.toDouble(),
-                    task.id
-                )
-                // Store task data for later retrieval
-                commands.set(taskKey(task.id), taskJson)
-                commands.expire(taskKey(task.id), 86400) // 24h TTL
+                // If message has ETA, add to sorted set for scheduling
+                val eta = task.eta
+                if (eta != null && eta > System.currentTimeMillis()) {
+                    commands.zadd(
+                        scheduledKey(),
+                        eta.toDouble(),
+                        task.id
+                    )
+                    // Store task data for later retrieval
+                    commands.set(taskKey(task.id), taskJson)
+                    commands.expire(taskKey(task.id), 86400) // 24h TTL
+                }
+                logger.debug("Enqueued task ${task.id} to $queue (message: $messageId)")
             }
-
-            logger.debug("Enqueued task ${task.id} to $queue (message: $messageId)")
 
         } catch (e: Exception) {
             logger.error("Failed to enqueue task ${task.id} to $queue", e)
@@ -76,6 +76,85 @@ class RedisMessageBroker(
     /**
      * Consume messages from a queue as a Flow.
      */
+//    override fun consume(
+//        queue: String,
+//        consumerGroup: String,
+//        consumerName: String,
+//        batchSize: Int,
+//        pollTimeout: Duration
+//    ): Flow<BrokerRecord> = flow {
+//        val streamKey = streamKey(queue)
+//        val consumerKey = "$consumerGroup-$consumerName"
+//
+//        try {
+//            connectionFactory.withCommands { commands ->
+//                // Create consumer group if not exists
+//                ensureConsumerGroup(commands, streamKey, consumerGroup)
+//
+//                // Start scheduler recovery
+//                val schedulerJob = scope.launch {
+//                    recoverScheduledTasks( queue)
+//                }
+//
+//                // Track this consumer
+//                activeConsumers[consumerKey] = currentCoroutineContext()[Job]!!
+//
+//                while (currentCoroutineContext().isActive) {
+//                    try {
+//                        val consumer = Consumer.from(consumerGroup, consumerName)
+////                        val streamOffset = XReadArgs.StreamOffset.latest(streamKey)
+//                        val streamOffset = XReadArgs.StreamOffset.from(streamKey, ">")
+//                        val readArgs = XReadArgs.Builder.count(batchSize.toLong())
+//                            .block(Duration.ofMillis(pollTimeout.toMillis()))
+//
+//                        commands.xreadgroup(consumer, readArgs, streamOffset).collect { message ->
+//                            if (message.stream != streamKey) return@collect
+//
+//                            val taskJson = message.body["task"] ?: return@collect
+//                            try {
+//                                val task = json.decodeFromString<TaskMessage>(taskJson)
+//
+//                                // Check expiration
+//                                if (task.isExpired()) {
+//                                    commands.xack(streamKey, consumerGroup, message.id)
+//                                    commands.xdel(streamKey, message.id)
+//                                    logger.info("Task ${task.id} expired, removed from queue")
+//                                    return@collect
+//                                }
+//                                val record = BrokerRecord(
+//                                    messageId = message.id,
+//                                    payload = task,
+//                                    streamKey = streamKey,
+//                                    group = consumerGroup,
+//                                    consumer = consumerName
+//                                )
+//                                emit(record)
+//                            } catch (e: Exception) {
+//                                logger.error("Failed to deserialize message ${message.id}", e)
+//                                // Acknowledge bad messages to prevent blocking
+//                                commands.xack(streamKey, consumerGroup, message.id)
+//                            }
+//                        }
+//
+//                        // Recover pending messages
+//                        recoverPending(commands, streamKey, consumerGroup, consumerName)
+//
+//                    } catch (e: TimeoutCancellationException) {
+//                        // Normal timeout, continue polling
+//                    } catch (e: CancellationException) {
+//                        throw e
+//                    } catch (e: Exception) {
+//                        logger.error("Error consuming from $queue", e)
+//                        delay(1.milliseconds)
+//                    }
+//                }
+//            }
+//
+//        } finally {
+//            activeConsumers.remove(consumerKey)
+//            logger.info("Consumer $consumerKey stopped")
+//        }
+//    }.flowOn(Dispatchers.IO)
     override fun consume(
         queue: String,
         consumerGroup: String,
@@ -83,74 +162,74 @@ class RedisMessageBroker(
         batchSize: Int,
         pollTimeout: Duration
     ): Flow<BrokerRecord> = flow {
-        val commands = connectionFactory.getCommands()
         val streamKey = streamKey(queue)
         val consumerKey = "$consumerGroup-$consumerName"
 
-        try {
-            // Create consumer group if not exists
+        // 1. Setup metadata on an ephemeral checkout
+        connectionFactory.withCommands { commands ->
             ensureConsumerGroup(commands, streamKey, consumerGroup)
+        }
 
-            // Start scheduler recovery
-            val schedulerJob = scope.launch {
-                recoverScheduledTasks(commands, queue)
-            }
+        val schedulerJob = scope.launch {
+            recoverScheduledTasks(queue)
+        }
 
-            // Track this consumer
-            activeConsumers[consumerKey] = currentCoroutineContext()[Job]!!
+        activeConsumers[consumerKey] = currentCoroutineContext()[Job]!!
 
-            while (currentCoroutineContext().isActive) {
-                try {
-                    val consumer = Consumer.from(consumerGroup, consumerName)
-                    val streamOffset = XReadArgs.StreamOffset.latest(streamKey)
-                    val readArgs = XReadArgs.Builder.count(batchSize.toLong())
-                        .block(java.time.Duration.ofMillis(pollTimeout.inWholeMilliseconds))
+        val consumer = Consumer.from(consumerGroup, consumerName)
+        val readArgs = XReadArgs.Builder.count(batchSize.toLong())
+            .block(java.time.Duration.ofMillis(pollTimeout.toMillis()))
+        val streamOffset = XReadArgs.StreamOffset.from(streamKey, ">")
 
-                    commands.xreadgroup(consumer, readArgs, streamOffset).collect { message ->
-                        if (message.stream != streamKey) return@collect
+        while (currentCoroutineContext().isActive) {
+            try {
+                // 2. Fetch data, then immediately drop the connection back to the pool
+                val messages = connectionFactory.withCommands { commands ->
+                    // Note: Change from reactive .collect to a direct coroutine call
+                    // If using Lettuce Coroutines, call the suspending variation that returns a List
+                    commands.xreadgroup(consumer, readArgs, streamOffset)
+                }
 
-                        val taskJson = message.body["task"] ?: return@collect
-                        try {
-                            val task = json.decodeFromString<TaskMessage>(taskJson)
+                // 3. Process records outside of the connection-borrow context
+                messages.collect { message ->
+                    if (message.stream != streamKey) return@collect
+                    val taskJson = message.body["task"] ?: return@collect
 
-                            // Check expiration
-                            if (task.isExpired()) {
-                                commands.xack(streamKey, consumerGroup, message.id)
-                                commands.xdel(streamKey, message.id)
-                                logger.info("Task ${task.id} expired, removed from queue")
-                                return@collect
+                    try {
+                        val task = json.decodeFromString<TaskMessage>(taskJson)
+                        if (task.isExpired()) {
+                            connectionFactory.withCommands { c ->
+                                c.xack(streamKey, consumerGroup, message.id)
+                                c.xdel(streamKey, message.id)
                             }
-                            val record = BrokerRecord(
+                            return@collect
+                        }
+
+                        emit(
+                            BrokerRecord(
                                 messageId = message.id,
                                 payload = task,
                                 streamKey = streamKey,
                                 group = consumerGroup,
                                 consumer = consumerName
                             )
-                            emit(record)
-                        } catch (e: Exception) {
-                            logger.error("Failed to deserialize message ${message.id}", e)
-                            // Acknowledge bad messages to prevent blocking
-                            commands.xack(streamKey, consumerGroup, message.id)
-                        }
+                        )
+                    } catch (e: Exception) {
+                        connectionFactory.withCommands { c -> c.xack(streamKey, consumerGroup, message.id) }
                     }
-
-                    // Recover pending messages
-                    recoverPending(commands, streamKey, consumerGroup, consumerName)
-
-                } catch (e: TimeoutCancellationException) {
-                    // Normal timeout, continue polling
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.error("Error consuming from $queue", e)
-                    delay(1.seconds)
                 }
-            }
 
-        } finally {
-            activeConsumers.remove(consumerKey)
-            logger.info("Consumer $consumerKey stopped")
+                // Periodic clean-ups can run on short checkouts too
+                connectionFactory.withCommands { commands ->
+                    recoverPending(commands, streamKey, consumerGroup, consumerName)
+                }
+
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("Error consuming from $queue", e)
+                delay(100.milliseconds)
+            }
         }
     }.flowOn(Dispatchers.IO)
 
@@ -158,11 +237,12 @@ class RedisMessageBroker(
      * Acknowledge successful processing.
      */
     override suspend fun ack(record: BrokerRecord) {
-        val commands = connectionFactory.getCommands()
         try {
-            commands.xack(record.streamKey, record.group, record.messageId)
-            commands.xdel(record.streamKey, record.messageId)
-            logger.debug("Acknowledged message: ${record.messageId}")
+            connectionFactory.withCommands { commands ->
+                commands.xack(record.streamKey, record.group, record.messageId)
+                commands.xdel(record.streamKey, record.messageId)
+                logger.debug("Acknowledged message: ${record.messageId}")
+            }
         } catch (e: Exception) {
             logger.error("Failed to ack message: ${record.messageId}", e)
         }
@@ -172,15 +252,16 @@ class RedisMessageBroker(
      * Negative-acknowledge (reject) a message.
      */
     override suspend fun nack(record: BrokerRecord, requeue: Boolean) {
-        val commands = connectionFactory.getCommands()
         try {
             if (requeue) {
                 // Let it stay pending for retry
                 logger.debug("NACK with requeue for message: ${record.messageId}")
             } else {
-                // Acknowledge and delete
-                commands.xack(record.streamKey, record.group, record.messageId)
-                commands.xdel(record.streamKey, record.messageId)
+                connectionFactory.withCommands { commands ->
+                    // Acknowledge and delete
+                    commands.xack(record.streamKey, record.group, record.messageId)
+                    commands.xdel(record.streamKey, record.messageId)
+                }
                 logger.debug("NACK without requeue for message: ${record.messageId}")
             }
         } catch (e: Exception) {
@@ -192,24 +273,25 @@ class RedisMessageBroker(
      * Move a message to dead letter queue.
      */
     override suspend fun deadLetter(record: BrokerRecord, reason: String) {
-        val commands = connectionFactory.getCommands()
         try {
             val dlqKey = deadLetterKey()
             val taskJson = json.encodeToString(record.payload)
 
-            commands.xadd(
-                dlqKey,
-                mapOf(
-                    "task" to taskJson,
-                    "reason" to reason,
-                    "original_queue" to record.streamKey,
-                    "failed_at" to java.time.Instant.now().toString()
+            connectionFactory.withCommands { commands ->
+                commands.xadd(
+                    dlqKey,
+                    mapOf(
+                        "task" to taskJson,
+                        "reason" to reason,
+                        "original_queue" to record.streamKey,
+                        "failed_at" to java.time.Instant.now().toString()
+                    )
                 )
-            )
 
-            // Remove from original queue
-            commands.xack(record.streamKey, record.group, record.messageId)
-            commands.xdel(record.streamKey, record.messageId)
+                // Remove from original queue
+                commands.xack(record.streamKey, record.group, record.messageId)
+                commands.xdel(record.streamKey, record.messageId)
+            }
 
             logger.info("Moved message ${record.messageId} to DLQ: $reason")
 
@@ -222,12 +304,13 @@ class RedisMessageBroker(
      * Schedule a task for future execution.
      */
     override suspend fun scheduleTask(task: TaskMessage) {
-        val commands = connectionFactory.getCommands()
         val score = task.eta?.toDouble() ?: System.currentTimeMillis().toDouble()
 
         try {
-            commands.zadd(scheduledKey(), score, task.id)
-            commands.set(taskKey(task.id), json.encodeToString(task))
+            connectionFactory.withCommands { commands ->
+                commands.zadd(scheduledKey(), score, task.id)
+                commands.set(taskKey(task.id), json.encodeToString(task))
+            }
             logger.debug("Scheduled task ${task.id} for $score")
         } catch (e: Exception) {
             logger.error("Failed to schedule task ${task.id}", e)
@@ -239,9 +322,10 @@ class RedisMessageBroker(
      * Get queue depth.
      */
     override suspend fun queueSize(queue: String): Long {
-        val commands = connectionFactory.getCommands()
         return try {
-            commands.xlen(streamKey(queue))
+            connectionFactory.withCommands { commands ->
+                commands.xlen(streamKey(queue))
+            }
         } catch (e: Exception) {
             logger.error("Failed to get queue size for $queue", e)
             0
@@ -252,10 +336,11 @@ class RedisMessageBroker(
      * Purge all messages from a queue.
      */
     override suspend fun purgeQueue(queue: String) {
-        val commands = connectionFactory.getCommands()
         val streamKey = streamKey(queue)
         try {
-            commands.del(streamKey)
+            connectionFactory.withCommands { commands ->
+                commands.del(streamKey)
+            }
             logger.info("Purged queue: $queue")
         } catch (e: Exception) {
             logger.error("Failed to purge queue: $queue", e)
@@ -308,12 +393,12 @@ class RedisMessageBroker(
     }
 
     private suspend fun recoverScheduledTasks(
-        commands: RedisCoroutinesCommands<String, String>,
         queue: String
     ) {
         while (currentCoroutineContext().isActive) {
             try {
                 val now = System.currentTimeMillis().toDouble()
+                connectionFactory.withCommands { commands ->
 
                 // Get tasks whose ETA has passed
                 val dueTaskIds = commands.zrangebyscore(
@@ -350,13 +435,14 @@ class RedisMessageBroker(
                 }
 
                 if (dueTaskIds.toList().isEmpty()) {
-                    delay(1.seconds)
+                    delay(1.milliseconds)
                 }
+            }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 logger.error("Error recovering scheduled tasks", e)
-                delay(5.seconds)
+                delay(5.milliseconds)
             }
         }
     }

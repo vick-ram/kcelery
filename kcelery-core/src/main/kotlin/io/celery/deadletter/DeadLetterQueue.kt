@@ -2,8 +2,14 @@ package io.celery.deadletter
 
 import io.celery.task.TaskMessage
 import kotlinx.coroutines.flow.Flow
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
@@ -90,7 +96,7 @@ interface DeadLetterQueue {
      * @param taskName Task name
      * @return Number of deleted records
      */
-    suspend fun deleteByTask(taskName: String): Int
+    suspend fun deleteByTask(taskName: String, batchSize: Int = 100): Int
 
     /**
      * Purge all dead letter records older than a duration.
@@ -113,12 +119,7 @@ interface DeadLetterQueue {
      * 
      * @return Dead letter statistics
      */
-    suspend fun getStats(): DeadLetterStats
-
-    /**
-     * Close dead letter queue resources.
-     */
-    suspend fun close()
+    suspend fun getStats(sampleSize: Int = 1000): DeadLetterStats
 }
 
 /**
@@ -148,6 +149,7 @@ data class DeadLetterRecord(
     val stackTrace: String? = null,
 
     /** When the failure occurred */
+    @Serializable(with = InstantSerializer::class)
     @SerialName("failed_at")
     val failedAt: Instant = Instant.now(),
 
@@ -156,6 +158,7 @@ data class DeadLetterRecord(
     val replayCount: Int = 0,
 
     /** Last replay attempt time */
+    @Serializable(with = InstantSerializer::class)
     @SerialName("last_replay_at")
     val lastReplayAt: Instant? = null,
 
@@ -176,6 +179,8 @@ data class DeadLetterRecord(
 data class DeadLetterStats(
     /** Total number of dead letters */
     val totalCount: Long,
+
+    val sampleSize: Int,
 
     /** Number of dead letters per task */
     val perTask: Map<String, Long>,
@@ -290,7 +295,7 @@ class InMemoryDeadLetterQueue : DeadLetterQueue {
         records.remove(deadLetterId)
     }
 
-    override suspend fun deleteByTask(taskName: String): Int {
+    override suspend fun deleteByTask(taskName: String, batchSize: Int): Int {
         lock.lock()
         try {
             val toRemove = records.values.filter { it.task.taskName == taskName }
@@ -325,11 +330,12 @@ class InMemoryDeadLetterQueue : DeadLetterQueue {
         }
     }
 
-    override suspend fun getStats(): DeadLetterStats {
+    override suspend fun getStats(sampleSize: Int): DeadLetterStats {
         lock.lock()
         try {
             return DeadLetterStats(
                 totalCount = records.size.toLong(),
+                sampleSize = sampleSize,
                 perTask = records.values.groupBy { it.task.taskName }
                     .mapValues { it.value.size.toLong() },
                 perReason = records.values.groupBy { it.reason }
@@ -344,8 +350,17 @@ class InMemoryDeadLetterQueue : DeadLetterQueue {
             lock.unlock()
         }
     }
+}
 
-    override suspend fun close() {
-        records.clear()
+object InstantSerializer: KSerializer<Instant> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("java.time.Instant", PrimitiveKind.STRING)
+
+    override fun serialize(encoder: Encoder, value: Instant) {
+        encoder.encodeString(value.toString()) // e.g. "2026-07-05T13:52:25Z"
+    }
+
+    override fun deserialize(decoder: Decoder): Instant {
+        return Instant.parse(decoder.decodeString())
     }
 }

@@ -2,6 +2,9 @@ package io.celery.task
 
 import kotlinx.serialization.KSerializer
 import org.slf4j.LoggerFactory
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Base class for all Celery tasks.
@@ -17,10 +20,11 @@ abstract class CeleryTask<T : Any>(
     val name: String,
     val maxRetries: Int = 3,
     val defaultRetryDelay: Long = 60,
+    val executionTimeout: Duration = 10.minutes,
     val serializer: KSerializer<T>,
     val autoAck: Boolean = true
 ) {
-    protected val logger = LoggerFactory.getLogger(javaClass)
+    protected val logger = LoggerFactory.getLogger(CeleryTask::class.java)
 
     /**
      * Execute the task with the given context.

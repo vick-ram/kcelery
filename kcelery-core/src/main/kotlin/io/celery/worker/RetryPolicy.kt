@@ -5,6 +5,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlin.time.Duration
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Retry policy calculator.

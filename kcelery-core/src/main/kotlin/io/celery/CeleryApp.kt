@@ -165,7 +165,6 @@ class CeleryApp private constructor(
      */
     fun getRegisteredTasks(): Set<String> = taskRegistry.keys.toSet()
 
-    // ==================== Async Task Sending ====================
 
     /**
      * Send a task for async execution.
@@ -498,7 +497,6 @@ class CeleryApp private constructor(
         // Close connections
         broker.close()
         backend?.close()
-        deadLetterQueue?.close()
         lock?.close()
         leaderElector?.close()
 
@@ -538,34 +536,32 @@ class CeleryApp private constructor(
         )
     }
 
-    /**
-     * Execute a task (called by schedulers and workers).
-     */
+    private suspend fun <T : Any> executeSafely(task: CeleryTask<T>, context: TaskContext) {
+        try {
+            task.beforeRun(context)
+            val result = task.run(context)   // returns T
+            task.onSuccess(context, result)  // expects T — compiles cleanly
+            task.afterRun(context)
+        } catch (e: Exception) {
+            logger.error("Task execution failed: ${task.name} [${context.taskId}]", e)
+            task.onFailure(context, e)
+            if (config.deadLetterEnabled && deadLetterQueue != null) {
+                deadLetterQueue.enqueue(
+                    task = TaskMessage.create(taskName = task.name),
+                    reason = "Task execution failed",
+                    exception = e
+                )
+            }
+        }
+    }
+
     private suspend fun executeTask(taskName: String, context: TaskContext) {
         val task = taskRegistry[taskName]
         if (task == null) {
             logger.error("Unknown task: $taskName")
             return
         }
-
-        try {
-            task.beforeRun(context)
-            val result = task.run(context)
-            task.onSuccess(context, result)
-            task.afterRun(context)
-        } catch (e: Exception) {
-            logger.error("Task execution failed: $taskName [${context.taskId}]", e)
-            task.onFailure(context, e)
-
-            // Move to dead letter if configured
-            if (config.deadLetterEnabled && deadLetterQueue != null) {
-                deadLetterQueue.enqueue(
-                    task = TaskMessage.create(taskName = taskName),
-                    reason = "Task execution failed",
-                    exception = e
-                )
-            }
-        }
+        executeSafely(task, context)
     }
 
     /**
@@ -621,7 +617,6 @@ class CeleryApp private constructor(
         }
     }
 
-    // ==================== Builder ====================
 
     /**
      * Create a new builder for CeleryApp.
@@ -724,7 +719,6 @@ class CeleryApp private constructor(
     }
 }
 
-// ==================== Configuration ====================
 
 /**
  * CeleryApp configuration.
@@ -753,7 +747,6 @@ data class CeleryConfig(
     val healthReportInterval: Duration
 )
 
-// ==================== Statistics ====================
 
 /**
  * Application statistics.
@@ -768,7 +761,6 @@ data class CeleryStats(
     val workerStats: io.celery.worker.PoolStats?
 )
 
-// ==================== Scheduler Type ====================
 
 /**
  * Type of scheduler.
