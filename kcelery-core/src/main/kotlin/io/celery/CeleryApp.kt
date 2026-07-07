@@ -34,71 +34,94 @@ import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Central orchestrator for kCelery.
- * Wires together broker, backend, locks, schedulers, and workers.
+ * Central orchestrator for the kCelery framework.
  *
- * This is the main entry point for applications using kCelery.
+ * Wires together the message broker, result backend, distributed locks,
+ * time-based schedulers, and multi-tenant worker pools. It acts as the primary
+ * engine interface for registering handlers, dispatching asynchronous payloads,
+ * and tracking cluster topology state transitions.
  *
- * Example usage:
+ * ### Example Usage:
  * ```kotlin
  * val app = CeleryApp.builder()
- *     .withName("my-app")
- *     .withBroker(redisBroker)
- *     .withBackend(redisBackend)
- *     .withLock(redisLock)
- *     .withLeaderElector(redisLeaderElector)
- *     .build()
+ *      .withName("analytics-service")
+ *      .withBroker(redisBroker)
+ *      .withBackend(redisBackend)
+ *      .withLeaderElector(redisLeaderElector)
+ *      .withDeadLetterQueue(deadLetterQueue)
+ *      .withWorkerCount(min = 2, max = 5)
+ *      .withWorkerConcurrency(4)
+ *      .withWorkerQueues(listOf("default", "high-priority", "emails"))
+ *      .withResultExpiry(1.hours)
+ *      .build()
  *
- * app.registerTask(myTask)
+ * app.registerTask(computeMetricsTask)
  * app.start()
  *
- * // Send tasks
- * app.sendTask("my-task", args = listOf(JsonPrimitive("arg1")))
+ * // Enqueue asynchronous execution
+ * app.sendTask("compute-metrics", args = listOf(JsonPrimitive("Q2-2026")))
  *
- * // Schedule tasks
- * app.scheduleCron("daily-task", "my-task", "0 0 9 * * *")
- *
- * // Shutdown
+ * // Graceful termination
  * app.stop()
  * ```
+ *
+ * @property config Internal frozen snapshot structure of configuration fields.
  */
 class CeleryApp private constructor(
     private val config: CeleryConfig
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
 
-    // Core components
+    /** The transport mechanism utilized to distribute raw message streams. Required**/
     private val broker: MessageBroker = config.broker
         ?: throw IllegalStateException("Broker is required")
+
+    /** The state tracker used to save task results **/
     private val backend: ResultBackend? = config.backend
+
+    /** Distributed coordination primitive used for standard cluster concurrency boundaries. */
     private val lock: DistributedLock? = config.lock
+
+    /** Consensus coordinator used to determine execution authority across cluster nodes. */
     private val leaderElector: LeaderElector? = config.leaderElector
+
+    /** Isolation sink used to contain corrupted or unparseable task messages. */
     private val deadLetterQueue: DeadLetterQueue? = config.deadLetterQueue
 
-    // Task registry
+    /** Thread-safe hash dictionary tracking active execution signatures using their string names. */
     private val taskRegistry = ConcurrentHashMap<String, CeleryTask<*>>()
 
-    // Schedulers
+    /** Dynamic cron parser engine. Will be instantiated if cron scheduling flags are checked. */
     private val cronScheduler: CronScheduler?
+
+    /** Interval timer loop that forces delays based on the termination threshold of the previous pass. */
     private val fixedDelayScheduler: FixedDelayScheduler?
+
+    /** Interval loop that forces executions uniformly across strict mathematical time frames. */
     private val fixedRateScheduler: FixedRateScheduler?
 
-    // Worker management
+    /** The active cluster worker structure wrapping concurrent polling queues. Managed at runtime. */
     private var workerPool: WorkerPool? = null
 
-    // Application state
+    /** Thread-safe lifecycle check evaluating if this engine instance is accepting messages. */
     private val isRunning = AtomicBoolean(false)
+
+    /** Dedicated context boundary for supervisor structures managing sub-components. */
     private val appScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    // Leadership
+    /** Leadership lease pointer containing renewal keys. Nullable if follower or single-node. */
     private var leadershipHandle: LockHandle? = null
+
+    /** Internal state collector publishing active cluster leadership status updates. */
     private val isLeader = MutableStateFlow(false)
 
-    // JSON serializer
+    /** Standard JSON serialization engine mapped for task arguments parsing. */
     private val json: Json = config.json
 
-    // Metrics
+    /** Monotonically increasing counter documenting tasks dispatched from this node instance. */
     private val tasksSent = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Monotonically increasing counter documenting recurring timers declared on this engine. */
     private val tasksScheduled = java.util.concurrent.atomic.AtomicLong(0)
 
     init {
@@ -122,13 +145,11 @@ class CeleryApp private constructor(
         logger.info("CeleryApp '${config.name}' initialized")
     }
 
-    // ==================== Task Registration ====================
-
     /**
-     * Register a task handler.
+     * Registers a single task handler into the execution table registry.
      *
-     * @param task The task to register
-     * @throws IllegalArgumentException if a task with the same name is already registered
+     * @param task The concrete task instance containing user business code.
+     * @throws IllegalArgumentException if an execution signature with an identical name already exists.
      */
     fun registerTask(task: CeleryTask<*>) {
         require(!taskRegistry.containsKey(task.name)){
@@ -139,14 +160,16 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Register multiple tasks.
+     * Registers a batch array of task execution handlers in bulk.
+     * * @param tasks Variable length argument mapping of tasks to register.
      */
     fun registerTasks(vararg tasks: CeleryTask<*>) {
         tasks.forEach { registerTask(it) }
     }
 
     /**
-     * Unregister a task.
+     * Purges a task name signature from the lookup dictionary.
+     * @param taskName The text label of the handler to remove.
      */
     fun unregisterTask(taskName: String) {
         taskRegistry.remove(taskName)
@@ -154,7 +177,9 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Check if a task is registered.
+     * Checks if a task identity label is currently loaded in the memory layout.
+     * @param taskName The target search parameter.
+     * @return True if the descriptor is found, false otherwise.
      */
     fun isTaskRegistered(taskName: String): Boolean {
         return taskRegistry.containsKey(taskName)
@@ -167,17 +192,18 @@ class CeleryApp private constructor(
 
 
     /**
-     * Send a task for async execution.
+     * Dispatches a complex task signature for non-blocking asynchronous execution.
      *
-     * @param taskName Registered task name
-     * @param args Task arguments
-     * @param kwargs Task keyword arguments
-     * @param queue Target queue name
-     * @param priority Task priority (0 = highest)
-     * @param delay Delay before execution
-     * @param expires Expiration time
-     * @param headers Additional headers
-     * @return TaskMessage with the task ID
+     * @param taskName The unique text key of the target task handler.
+     * @param args Positional data parameters embedded into a JSON array layout.
+     * @param kwargs Named query keyword arguments mapped inside a JSON string hash dictionary.
+     * @param queue Target queue label routing path. Defaults to `"default"`.
+     * @param priority Evaluation hierarchy prioritization. `0` maps as immediate attention.
+     * @param delay Time window to wait before routing this record out to active consumers.
+     * @param expires A terminal lifecycle window after which the message is declared stale.
+     * @param headers Metadictionary blocks capturing ambient context traces.
+     * @return A completed [TaskMessage] instance tracking the allocated task ID.
+     * @throws IllegalArgumentException if the target task signature is unknown to this node instance.
      */
     suspend fun sendTask(
         taskName: String,
@@ -223,7 +249,7 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Send a task with a simple string argument.
+     * Dispatches a task signature utilizing a simplified primitive String parameter structure.
      */
     suspend fun sendTask(
         taskName: String,
@@ -240,7 +266,7 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Send a batch of tasks.
+     * Dispatches multiple processing records wrapped together across uniform matrix arrays.
      */
     suspend fun sendBatch(
         taskName: String,
@@ -253,16 +279,14 @@ class CeleryApp private constructor(
         }
     }
 
-    // ==================== Scheduled Tasks ====================
-
     /**
-     * Schedule a task with a cron expression.
+     * Schedules a recurring execution signature regulated by an advanced standard Cron expression pattern.
      *
-     * @param scheduleId Unique schedule identifier
-     * @param taskName Registered task name
-     * @param cronExpression Cron expression (e.g., "0 0 9 * * *" for 9 AM daily)
-     * @param config Task configuration
-     * @return Schedule ID
+     * @param scheduleId Unique textual reference used to isolate this scheduling pointer.
+     * @param taskName Target task handler mapping identity label.
+     * @param cronExpression Five or six field parsing string token matching standard Unix/Quartz intervals.
+     * @param config Ad-hoc local configurations override parameters.
+     * @return Generated schedule string key mappings.
      */
     fun scheduleCron(
         scheduleId: String,
@@ -281,7 +305,7 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Schedule a task with a fixed delay.
+     * Schedules a recurring task loop structured using a strict pause window injected between operational iterations.
      *
      * @param scheduleId Unique schedule identifier
      * @param taskName Registered task name
@@ -306,7 +330,7 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Schedule a task at a fixed rate.
+     * Schedules a task instance across fixed intervals, attempting to maintain execution cadence regardless of previous runtimes
      *
      * @param scheduleId Unique schedule identifier
      * @param taskName Registered task name
@@ -333,7 +357,10 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Unschedule a task.
+     * Unloads a loaded schedule pointer out of processing pipelines.
+     *
+     * @param scheduleId Target registration key to drop.
+     * @param schedulerType Strategy class context of the target schedule instance.
      */
     fun unschedule(scheduleId: String, schedulerType: SchedulerType = SchedulerType.CRON) {
         when (schedulerType) {
@@ -343,8 +370,6 @@ class CeleryApp private constructor(
         }
         logger.info("Unscheduled task: $scheduleId")
     }
-
-    // ==================== Result Management ====================
 
     /**
      * Get a task result.
@@ -361,7 +386,13 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Wait for a task to complete.
+     * Suspend-waits for a task to arrive at a terminal state, evaluating the backend at timed intervals.
+     *
+     * This function performs non-blocking coroutine pooling, freeing the host thread pool to process in-flight tasks.
+     *
+     * @param timeout Absolute time ceiling threshold before terminating the search.
+     * @param pollInterval Delay frequency window injected between subsequent checks.
+     * @return Captured state properties, or null if the timeout ceiling is breached.
      */
     suspend fun waitForResult(
         taskId: String,
@@ -384,7 +415,9 @@ class CeleryApp private constructor(
 
 
     /**
-     * Revoke (cancel) a task.
+     * Signals cancellation across both active tracking structures and external worker buffers.
+     *
+     * @return True to document the dispatch of revocation signals.
      */
     suspend fun revokeTask(taskId: String): Boolean {
         backend?.revokeTask(taskId)
@@ -393,11 +426,10 @@ class CeleryApp private constructor(
         return true
     }
 
-    // ==================== Application Lifecycle ====================
-
     /**
-     * Start the application.
-     * Starts schedulers, workers, and acquires leadership if configured.
+     * Bootstraps the application orchestrator.
+     * * Initiates supervisor scopes, campaigns for cluster consensus leadership loops,
+     * activates time-based scheduling pipelines, and starts thread-concurrency worker threads.
      */
     suspend fun start() {
         if (!isRunning.compareAndSet(false, true)) {
@@ -464,7 +496,16 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Stop the application gracefully.
+     * Halts all processing loops gracefully.
+     *
+     * Order of Operations:
+     * 1. Tears down active schedulers to halt incoming task increments.
+     * 2. Signals worker pools to finish in-flight records while refusing incoming ones.
+     * 3. Relinquishes consensus leader tags.
+     * 4. Safe-closes network connections to brokers, locks, and backend servers.
+     * 5. Invalidates the parent Coroutine Scope.
+     *
+     * @param timeout Maximum absolute safety window allowed to drain active tasks before forcing closure.
      */
     suspend fun stop(timeout: Duration = 30.seconds) {
         if (!isRunning.compareAndSet(true, false)) {
@@ -507,17 +548,17 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Check if the application is running.
+     * Checks if this instance is actively processing data or accepting incoming signals.
      */
     fun isRunning(): Boolean = isRunning.get()
 
     /**
-     * Check if this instance is the leader.
+     * Checks if this engine instance holds the active leader lock of its cluster group.
      */
     fun isLeader(): Boolean = isLeader.value
 
     /**
-     * Observe leadership status.
+     * Returns a reactive flow channel tracking leadership promotion/demotion updates.
      */
     fun observeLeadership(): StateFlow<Boolean> = isLeader.asStateFlow()
 
@@ -536,6 +577,10 @@ class CeleryApp private constructor(
         )
     }
 
+    /**
+     * Executes internal hooks (`beforeRun`, `onSuccess`, `onFailure`) around a task execution signature.
+     * * Catches and encapsulates target exceptions, routing failures safely to the DLQ structure if enabled.
+     */
     private suspend fun <T : Any> executeSafely(task: CeleryTask<T>, context: TaskContext) {
         try {
             task.beforeRun(context)
@@ -555,6 +600,9 @@ class CeleryApp private constructor(
         }
     }
 
+    /**
+     * Matches string signatures to task registrations and passes routing contexts to [executeSafely].
+     */
     private suspend fun executeTask(taskName: String, context: TaskContext) {
         val task = taskRegistry[taskName]
         if (task == null) {
@@ -565,7 +613,7 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Monitor leadership and handle promotion/demotion.
+     * Spins up an async monitoring block watching consensus state flows to adjust local schedulers.
      */
     private fun startLeadershipMonitor() {
         appScope.launch {
@@ -599,7 +647,7 @@ class CeleryApp private constructor(
     }
 
     /**
-     * Periodic health reporting.
+     * Establishes background coroutine routines printing performance telemetry metrics at set intervals.
      */
     private fun startHealthReporter() {
         appScope.launch {

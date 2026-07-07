@@ -1,4 +1,3 @@
-// kcelery-core/src/main/kotlin/io/celery/worker/WorkerPool.kt
 package io.celery.worker
 
 import io.celery.broker.MessageBroker
